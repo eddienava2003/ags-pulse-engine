@@ -16,12 +16,31 @@ app.add_middleware(
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 @app.get("/")
 def root():
     return {"status": "online"}
 
+
 @app.get("/ping")
 def ping():
     return {"ok": True}
+
+
+@app.get("/db-test")
+def db_test():
+    result = (
+        supabase
+        .table("shipment_telemetry")
+        .select("*")
+        .limit(10)
+        .execute()
+    )
+
+    return {
+        "connected": True,
+        "records": result.data
+    }
