@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import os
 import logging
+import secrets
 from datetime import datetime, timezone
 
 
@@ -61,7 +63,9 @@ def route_matches(telemetry, origin, destination, require_complete=False):
     telemetry_origin = clean(telemetry.get("origin"))
     telemetry_destination = clean(telemetry.get("destination"))
 
-    if require_complete and (not telemetry_origin or not telemetry_destination):
+    if require_complete and (
+        not telemetry_origin or not telemetry_destination
+    ):
         return False
 
     if telemetry_origin and not same_value(telemetry_origin, origin):
@@ -147,16 +151,6 @@ def genrai_status():
 
 
 def execute_genrai_telemetry_sync():
-    """
-    GENRAI-1 v1.5.1
-
-    - Uses shipment_id as the primary relationship.
-    - Matches older unlinked telemetry only when tracking and
-      both route fields match exactly (ignoring letter case).
-    - Preserves existing telemetry history.
-    - Updates only the latest valid telemetry record per shipment.
-    - Does not invent dwell times or delay detection.
-    """
 
     stats = {
         "shipments_checked": 0,
@@ -201,7 +195,6 @@ def execute_genrai_telemetry_sync():
                 stats["shipments_skipped"] += 1
                 continue
 
-            # First look for telemetry already linked by foreign key.
             linked_result = (
                 supabase.table("shipment_telemetry")
                 .select("*")
@@ -211,7 +204,6 @@ def execute_genrai_telemetry_sync():
 
             linked_rows = linked_result.data or []
 
-            # If no linked telemetry exists, inspect older unlinked rows.
             if not linked_rows:
                 legacy_result = (
                     supabase.table("shipment_telemetry")
@@ -224,9 +216,8 @@ def execute_genrai_telemetry_sync():
                 legacy_rows = legacy_result.data or []
 
                 for row in legacy_rows:
-                    # Both route fields must exist and match before linking.
                     if (
-                        clean(row.get("rfq_id")) == tracking_number
+                        same_value(row.get("rfq_id"), tracking_number)
                         and route_matches(
                             row,
                             origin,
@@ -244,7 +235,6 @@ def execute_genrai_telemetry_sync():
 
                         stats["existing_records_linked"] += 1
 
-                # Re-read records after attempting safe legacy linking.
                 linked_result = (
                     supabase.table("shipment_telemetry")
                     .select("*")
@@ -254,7 +244,6 @@ def execute_genrai_telemetry_sync():
 
                 linked_rows = linked_result.data or []
 
-            # Create a new record only if no safe association exists.
             if not linked_rows:
                 (
                     supabase.table("shipment_telemetry")
@@ -274,7 +263,6 @@ def execute_genrai_telemetry_sync():
                 stats["records_created"] += 1
                 continue
 
-            # Keep only records whose tracking and route do not conflict.
             valid_rows = []
 
             for row in linked_rows:
@@ -292,14 +280,12 @@ def execute_genrai_telemetry_sync():
 
             if not valid_rows:
                 logger.warning(
-                    "Skipped shipment %s: linked telemetry has a tracking "
-                    "number or route mismatch.",
+                    "Skipped shipment %s due to tracking or route mismatch.",
                     shipment_id
                 )
                 stats["shipments_skipped"] += 1
                 continue
 
-            # Select the latest valid telemetry record.
             valid_rows.sort(
                 key=lambda row: (
                     clean(row.get("created_at")),
@@ -309,6 +295,7 @@ def execute_genrai_telemetry_sync():
             )
 
             latest = valid_rows[0]
+
             changes = {
                 "last_autonomous_check": current_time
             }
@@ -345,6 +332,7 @@ def execute_genrai_telemetry_sync():
                 "Synchronization failed for shipment ID %s.",
                 shipment.get("id")
             )
+
             stats["errors"].append({
                 "shipment_id": shipment.get("id"),
                 "error": str(exc)
@@ -359,7 +347,23 @@ def execute_genrai_telemetry_sync():
 
 
 @app.post("/genrai/run-telemetry-sync")
-def run_telemetry_sync():
+def run_telemetry_sync(
+    x_genrai_token: str = Header(default="")
+):
+    expected_token = os.getenv("GENRAI_SYNC_TOKEN")
+
+    if not expected_token:
+        raise HTTPException(
+            status_code=503,
+            detail="GENRAI synchronization token is not configured."
+        )
+
+    if not secrets.compare_digest(x_genrai_token, expected_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized."
+        )
+
     try:
         results = execute_genrai_telemetry_sync()
 
@@ -369,8 +373,8 @@ def run_telemetry_sync():
         }
 
     except Exception:
-        logger.exception("GENRAI-1 synchronization could not complete.")
+        logger.exception("GENRAI-1 synchronization failed.")
         raise HTTPException(
             status_code=500,
-            detail="GENRAI-1 synchronization failed. Check Render logs."
+            detail="Synchronization failed. Check Render logs."
         )
