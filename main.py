@@ -11,7 +11,7 @@ import secrets
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 app = FastAPI(
     title="AGS-Pulse & GENRAI-1 Core API",
