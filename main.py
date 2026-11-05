@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -300,6 +299,7 @@ def build_ai_input(report):
         shipment_inputs.append({
             "reference": reference,
             "master_status": shipment.get("master_status"),
+            "carrier": shipment.get("carrier"),
             "monitoring_state": shipment.get("monitoring_state"),
             "recorded_dwell_hours": shipment.get(
                 "recorded_dwell_hours"
@@ -755,6 +755,18 @@ def execute_genrai_telemetry_sync():
                         "origin": origin,
                         "destination": destination,
                         "status": status,
+                        "hub_location": (
+                            clean(shipment.get("hub_location")) or None
+                        ),
+                        "status_update": (
+                            clean(shipment.get("status_update")) or None
+                        ),
+                        "estimated_delivery": (
+                            clean(shipment.get("estimated_delivery")) or None
+                        ),
+                        "carrier": (
+                            clean(shipment.get("carrier")) or None
+                        ),
                         "delay_flag": False,
                         "last_updated": current_time,
                         "last_autonomous_check": current_time
@@ -815,6 +827,24 @@ def execute_genrai_telemetry_sync():
 
             if not clean(latest.get("destination")):
                 changes["destination"] = destination
+
+            # Transfer operational fields from shipments.
+            # Never overwrite existing telemetry with NULL or empty values.
+
+            for field in (
+                "hub_location",
+                "status_update",
+                "estimated_delivery",
+                "carrier"
+            ):
+
+                source_value = shipment.get(field)
+
+                if source_value is not None and clean(source_value):
+
+                    if clean(latest.get(field)) != clean(source_value):
+
+                        changes[field] = clean(source_value)
 
             status_changed = not same_value(
                 latest.get("status"), status
@@ -920,7 +950,7 @@ def execute_genrai_autonomous_monitor():
             supabase.table("shipment_telemetry")
             .select(
                 "id,shipment_id,rfq_id,hub_location,"
-                "status_update,estimated_delivery,"
+                "status_update,estimated_delivery,carrier,"
                 "delay_flag,dwell_hours,delay_reason,"
                 "last_updated,last_autonomous_check,"
                 "created_at"
@@ -968,6 +998,7 @@ def execute_genrai_autonomous_monitor():
                 "destination": shipment.get("destination")
             },
             "master_status": shipment.get("status"),
+            "carrier": None,
             "monitoring_state": "UNKNOWN",
             "missing_information": [],
             "recorded_dwell_hours": None,
@@ -1028,6 +1059,8 @@ def execute_genrai_autonomous_monitor():
             )
 
             telemetry = valid_rows[0]
+
+            result["carrier"] = telemetry.get("carrier")
 
             required_fields = {
                 "hub_location": telemetry.get("hub_location"),
@@ -1228,4 +1261,4 @@ def run_intelligence_analysis(
                 "Intelligence analysis failed. "
                 "Check Render logs."
             )
-        )
+            )
