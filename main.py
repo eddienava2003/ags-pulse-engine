@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -7,11 +6,22 @@ import os
 import json
 import logging
 import secrets
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
+
+DWELL_TIME_THRESHOLD_HOURS = 12
+MAX_AI_SHIPMENTS = 100
+
+TERMINAL_STATUSES = {
+    "delivered",
+    "completed",
+    "cancelled",
+    "canceled"
+}
 
 app = FastAPI(
     title="AGS-Pulse & GENRAI-1 Core API",
@@ -22,9 +32,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-GENRAI-TOKEN"]
 )
+
 
 # --------------------------------------------------
 # SUPABASE CONNECTION
@@ -38,13 +49,18 @@ def get_supabase_client() -> Client:
     )
 
     if not url or not key:
-        raise RuntimeError("Supabase configuration is missing.")
+        raise RuntimeError(
+            "Supabase configuration is missing. "
+            "Set SUPABASE_URL and SUPABASE_SECRET_KEY "
+            "or SUPABASE_KEY in Render."
+        )
 
     return create_client(url, key)
 
 
 try:
     supabase = get_supabase_client()
+    logger.info("Supabase client initialized successfully.")
 except Exception:
     logger.exception("Could not initialize Supabase client.")
     raise
@@ -53,17 +69,6 @@ except Exception:
 # --------------------------------------------------
 # CORE UTILITIES
 # --------------------------------------------------
-
-DWELL_TIME_THRESHOLD_HOURS = 12
-MAX_AI_SHIPMENTS = 100
-
-TERMINAL_STATUSES = {
-    "delivered",
-    "completed",
-    "cancelled",
-    "canceled"
-}
-
 
 def now_utc():
     return datetime.now(timezone.utc).isoformat()
@@ -80,7 +85,8 @@ def same_value(first, second):
 
 
 def authorize_genrai(token):
-    expected_token = os.getenv("GENRAI_SYNC_TOKEN")
+    expected_token = os.getenv("GENRAI_SYNC_TOKEN", "").strip()
+    supplied_token = clean(token)
 
     if not expected_token:
         raise HTTPException(
@@ -88,11 +94,46 @@ def authorize_genrai(token):
             detail="GENRAI authentication token is not configured."
         )
 
-    if not secrets.compare_digest(clean(token), expected_token):
+    if not supplied_token or not secrets.compare_digest(
+        supplied_token,
+        expected_token
+    ):
         raise HTTPException(
             status_code=401,
             detail="Unauthorized."
         )
+
+
+def parse_dwell_hours(value):
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        result = float(value)
+
+        if not math.isfinite(result) or result < 0:
+            return None
+
+        return result
+
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def safe_row_sort_key(row):
+    created_at = clean(row.get("created_at"))
+    raw_id = row.get("id")
+
+    try:
+        numeric_id = int(raw_id)
+    except (TypeError, ValueError, OverflowError):
+        numeric_id = -1
+
+    return (
+        created_at,
+        numeric_id,
+        clean(raw_id)
+    )
 
 
 def route_matches(
@@ -120,22 +161,6 @@ def route_matches(
         return False
 
     return True
-
-
-def parse_dwell_hours(value):
-    if value is None:
-        return None
-
-    try:
-        result = float(value)
-
-        if result < 0:
-            return None
-
-        return result
-
-    except (TypeError, ValueError):
-        return None
 
 
 def parse_estimated_delivery(value):
@@ -187,13 +212,96 @@ def delivery_is_overdue(estimated_delivery, current_time):
 
 
 # --------------------------------------------------
+# TELEMETRY EVENT WEBHOOK
+# --------------------------------------------------
+
+@app.post("/api/v1/telemetry-event")
+async def receive_telemetry_event(
+    payload: dict,
+    x_genrai_token: str = Header(default="")
+):
+    authorize_genrai(x_genrai_token)
+
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty telemetry event."
+        )
+
+    findings = []
+    signals_evaluated = []
+    invalid_fields = []
+
+    # DWELL-TIME EVALUATION
+
+    if "dwell_hours" in payload:
+        dwell_hours = parse_dwell_hours(
+            payload.get("dwell_hours")
+        )
+
+        if dwell_hours is None:
+            invalid_fields.append("dwell_hours")
+        else:
+            signals_evaluated.append("dwell_time")
+
+            if dwell_hours > DWELL_TIME_THRESHOLD_HOURS:
+                findings.append({
+                    "type": "EXCESSIVE_DWELL",
+                    "value": dwell_hours,
+                    "threshold": DWELL_TIME_THRESHOLD_HOURS
+                })
+
+    # DELAY-FLAG EVALUATION
+
+    if "delay_flag" in payload:
+        delay_flag = payload.get("delay_flag")
+
+        if not isinstance(delay_flag, bool):
+            invalid_fields.append("delay_flag")
+        else:
+            signals_evaluated.append("delay_flag")
+
+            if delay_flag:
+                findings.append({
+                    "type": "DELAY_FLAG"
+                })
+
+    if findings:
+        state = "ALERT"
+    elif signals_evaluated:
+        state = "CLEAR"
+    else:
+        state = "UNKNOWN"
+
+    logger.info(
+        "GENRAI telemetry event received: "
+        "event_id=%s state=%s signals=%s",
+        clean(payload.get("id"))[:100],
+        state,
+        signals_evaluated
+    )
+
+    return {
+        "success": True,
+        "event_id": payload.get("id"),
+        "shipment_id": payload.get("shipment_id"),
+        "rfq_id": payload.get("rfq_id"),
+        "monitoring_state": state,
+        "signals_evaluated": signals_evaluated,
+        "invalid_fields": invalid_fields,
+        "findings": findings,
+        "database_modified": False,
+        "processed_at": now_utc()
+    }
+
+
+# --------------------------------------------------
 # GENRAI-1 LOCAL RULES ENGINE
 # --------------------------------------------------
 
 def execute_local_rules_engine(report):
 
     shipments = report.get("shipments", [])
-
     findings = []
 
     for index, shipment in enumerate(shipments, start=1):
@@ -201,7 +309,6 @@ def execute_local_rules_engine(report):
         reference = f"S{index:03d}"
 
         state = shipment.get("monitoring_state")
-        dwell = shipment.get("recorded_dwell_hours")
         overdue = shipment.get("overdue_estimated_delivery")
         missing = shipment.get("missing_information", [])
 
@@ -246,13 +353,10 @@ def execute_local_rules_engine(report):
             })
 
     if not findings:
-
         findings.append({
             "reference": "SYSTEM",
             "finding": "No active shipment alerts were identified.",
-            "recommended_action": (
-                "Continue routine monitoring."
-            ),
+            "recommended_action": "Continue routine monitoring.",
             "reasons": []
         })
 
@@ -288,9 +392,6 @@ def build_ai_input(report):
     ):
 
         reference = f"S{index:03d}"
-
-        # Keep actual identifiers inside AGS-Pulse.
-        # Do not send tracking numbers or shipment IDs to OpenAI.
 
         reference_map[reference] = {
             "shipment_id": shipment.get("shipment_id"),
@@ -333,9 +434,7 @@ def build_ai_input(report):
             )
         },
         "shipment_data": shipment_inputs,
-        "records_truncated": (
-            len(shipments) > MAX_AI_SHIPMENTS
-        )
+        "records_truncated": len(shipments) > MAX_AI_SHIPMENTS
     }
 
     return payload, reference_map
@@ -469,11 +568,9 @@ def run_openai_reasoning(report):
 
         parsed_output = json.loads(raw_output)
 
-        valid_references = set(reference_map.keys())
-
         validated = validate_ai_output(
             parsed_output,
-            valid_references
+            set(reference_map.keys())
         )
 
         return {
@@ -504,7 +601,6 @@ def execute_genrai_reasoning(report):
 
     except Exception as exc:
 
-        # Do not expose API keys or sensitive exception details.
         logger.warning(
             "OpenAI reasoning unavailable. "
             "Activating local rules engine. Error type: %s",
@@ -577,8 +673,16 @@ def database_health():
         )
 
 
+# --------------------------------------------------
+# PROTECTED DATABASE TEST ENDPOINT
+# --------------------------------------------------
+
 @app.get("/db-test")
-def db_test():
+def db_test(
+    x_genrai_token: str = Header(default="")
+):
+
+    authorize_genrai(x_genrai_token)
 
     try:
 
@@ -794,10 +898,7 @@ def execute_genrai_telemetry_sync():
                 continue
 
             valid_rows.sort(
-                key=lambda row: (
-                    clean(row.get("created_at")),
-                    int(row.get("id") or 0)
-                ),
+                key=safe_row_sort_key,
                 reverse=True
             )
 
@@ -821,7 +922,6 @@ def execute_genrai_telemetry_sync():
             )
 
             if status_changed:
-
                 changes["status"] = status
                 changes["last_updated"] = current_time
 
@@ -850,7 +950,16 @@ def execute_genrai_telemetry_sync():
     stats["success"] = len(stats["errors"]) == 0
     stats["completed_at"] = now_utc()
 
-    logger.info("GENRAI-1 sync results: %s", stats)
+    logger.info(
+        "GENRAI-1 sync completed: checked=%s created=%s "
+        "updated=%s linked=%s skipped=%s errors=%s",
+        stats["shipments_checked"],
+        stats["records_created"],
+        stats["records_updated"],
+        stats["existing_records_linked"],
+        stats["shipments_skipped"],
+        len(stats["errors"])
+    )
 
     return stats
 
@@ -1020,10 +1129,7 @@ def execute_genrai_autonomous_monitor():
                 continue
 
             valid_rows.sort(
-                key=lambda row: (
-                    clean(row.get("created_at")),
-                    int(row.get("id") or 0)
-                ),
+                key=safe_row_sort_key,
                 reverse=True
             )
 
@@ -1050,7 +1156,6 @@ def execute_genrai_autonomous_monitor():
             result["recorded_dwell_hours"] = dwell_hours
 
             if dwell_hours is not None:
-
                 result["dwell_threshold_exceeded"] = (
                     dwell_hours > DWELL_TIME_THRESHOLD_HOURS
                 )
@@ -1074,11 +1179,8 @@ def execute_genrai_autonomous_monitor():
                 ).casefold() in TERMINAL_STATUSES
 
                 if terminal:
-
                     result["overdue_estimated_delivery"] = False
-
                 else:
-
                     result["overdue_estimated_delivery"] = (
                         delivery_is_overdue(
                             estimated_delivery,
@@ -1123,15 +1225,26 @@ def execute_genrai_autonomous_monitor():
                 "error": str(exc)
             })
 
+            result["monitoring_state"] = "UNKNOWN"
+            result["missing_information"].append(
+                "Monitoring evaluation failed"
+            )
+
+            report["unknown_shipments"] += 1
+            report["shipments"].append(result)
+
     report["monitoring_completed"] = now_utc()
 
-    report["success"] = (
-        len(report["errors"]) == 0
-    )
+    report["success"] = len(report["errors"]) == 0
 
     logger.info(
-        "GENRAI-1 autonomous monitoring report: %s",
-        report
+        "GENRAI-1 monitoring completed: checked=%s clear=%s "
+        "unknown=%s alerts=%s errors=%s",
+        report["shipments_checked"],
+        report["clear_shipments"],
+        report["unknown_shipments"],
+        report["alerts_recommended"],
+        len(report["errors"])
     )
 
     return report
@@ -1172,7 +1285,7 @@ def run_autonomous_monitor(
 
 
 # --------------------------------------------------
-# NEW v1.7.0 INTELLIGENCE ANALYSIS ENDPOINT
+# INTELLIGENCE ANALYSIS ENDPOINT
 # --------------------------------------------------
 
 @app.post("/genrai/run-intelligence-analysis")
@@ -1184,17 +1297,14 @@ def run_intelligence_analysis(
 
     try:
 
-        # Obtain the existing read-only monitoring report.
         report = execute_genrai_autonomous_monitor()
 
-        # Stop if the monitoring report is incomplete.
         if not report.get("success"):
             raise HTTPException(
                 status_code=503,
                 detail="Monitoring report contains errors."
             )
 
-        # OpenAI is primary; local rules are fallback.
         reasoning = execute_genrai_reasoning(report)
 
         return {
