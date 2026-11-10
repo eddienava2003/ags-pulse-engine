@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from datetime import datetime, timezone, date
@@ -7,6 +7,9 @@ import json
 import logging
 import secrets
 import math
+import base64
+import hashlib
+import hmac
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
@@ -33,7 +36,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-GENRAI-TOKEN"]
+    allow_headers=["Content-Type", "X-GENRAI-TOKEN", "aftership-hmac-sha256"]
 )
 
 
@@ -337,15 +340,48 @@ async def receive_telemetry_event(
 
 @app.post("/integrations/aftership/webhook")
 async def receive_aftership_webhook(
-    payload: dict,
-    x_genrai_token: str = Header(default="")
+    request: Request,
+    aftership_signature: str = Header(
+        default="",
+        alias="aftership-hmac-sha256"
+    )
 ):
-    # AfterShip receives a dedicated secret in its custom webhook header.
-    expected_token = os.getenv("AFTERSHIP_WEBHOOK_TOKEN", "").strip()
-    if not expected_token or not x_genrai_token or not secrets.compare_digest(
-        x_genrai_token, expected_token
-    ):
-        raise HTTPException(status_code=401, detail="Unauthorized AfterShip webhook.")
+    # Verify AfterShip's signature against the exact raw request bytes.
+    webhook_secret = os.getenv("AFTERSHIP_WEBHOOK_SECRET", "").strip()
+    if not webhook_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="AfterShip webhook signature secret is not configured."
+        )
+
+    if not aftership_signature:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing AfterShip webhook signature."
+        )
+
+    raw_body = await request.body()
+    expected_signature = base64.b64encode(
+        hmac.new(
+            webhook_secret.encode("utf-8"),
+            raw_body,
+            hashlib.sha256
+        ).digest()
+    ).decode("ascii")
+
+    if not secrets.compare_digest(aftership_signature.strip(), expected_signature):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid AfterShip webhook signature."
+        )
+
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=400,
+            detail="A valid JSON webhook object is required."
+        )
 
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="A JSON webhook object is required.")
@@ -897,7 +933,6 @@ def database_health():
         }
 
     except Exception:
-
         logger.exception("Database health check failed.")
 
         raise HTTPException(
