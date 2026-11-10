@@ -330,6 +330,200 @@ async def receive_telemetry_event(
         )
 
 
+
+# --------------------------------------------------
+# AFTERSHIP TRACKING WEBHOOK
+# --------------------------------------------------
+
+@app.post("/integrations/aftership/webhook")
+async def receive_aftership_webhook(
+    payload: dict,
+    x_genrai_token: str = Header(default="")
+):
+    # Configure this exact custom header in AfterShip's webhook settings.
+    # The shared secret is stored in Render as GENRAI_SYNC_TOKEN.
+    authorize_genrai(x_genrai_token)
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON webhook object is required.")
+
+    event_name = clean(payload.get("event"))
+    if event_name not in {"tracking_update", "edd_revise", "tracking_pending_time"}:
+        return {"success": True, "ignored": True, "reason": "Unsupported AfterShip event."}
+
+    msg = payload.get("msg")
+    if not isinstance(msg, dict):
+        raise HTTPException(status_code=400, detail="AfterShip msg object is required.")
+
+    tracking_number = clean(msg.get("tracking_number"))
+    if not tracking_number:
+        raise HTTPException(status_code=400, detail="AfterShip tracking_number is required.")
+
+    try:
+        shipment_result = (
+            supabase.table("shipments")
+            .select("id,tracking_number,status,carrier")
+            .eq("tracking_number", tracking_number)
+            .limit(1)
+            .execute()
+        )
+        shipments = shipment_result.data or []
+        if not shipments:
+            logger.warning("AfterShip tracking number is not mapped to an AGS shipment.")
+            return {"success": True, "unmatched": True, "tracking_number": tracking_number}
+
+        shipment = shipments[0]
+        telemetry_result = (
+            supabase.table("shipment_telemetry")
+            .select("id,dwell_hours,delay_flag")
+            .eq("shipment_id", shipment["id"])
+            .order("last_updated", desc=True)
+            .limit(1)
+            .execute()
+        )
+        telemetry_rows = telemetry_result.data or []
+        if not telemetry_rows:
+            raise RuntimeError("Shipment has no linked telemetry row; refusing an unlinked write.")
+        telemetry = telemetry_rows[0]
+        telemetry_id = telemetry["id"]
+
+        checkpoints = msg.get("checkpoints") or []
+        latest_checkpoint = checkpoints[-1] if isinstance(checkpoints, list) and checkpoints else {}
+        if not isinstance(latest_checkpoint, dict):
+            latest_checkpoint = {}
+
+        operational_status = clean(
+            latest_checkpoint.get("subtag_message")
+            or msg.get("subtag_message")
+            or msg.get("tag")
+            or event_name
+        )[:200]
+        location = clean(
+            latest_checkpoint.get("location")
+            or latest_checkpoint.get("city")
+            or msg.get("destination_city")
+        )[:250]
+        carrier = clean(msg.get("slug") or shipment.get("carrier"))[:100]
+        tag = clean(msg.get("tag") or latest_checkpoint.get("tag"))
+        delay_flag = tag.casefold() in {"exception", "failedattempt", "expired"}
+
+        estimated = (
+            (msg.get("latest_estimated_delivery") or {}).get("datetime")
+            or (msg.get("aftership_estimated_delivery_date") or {}).get("estimated_delivery_date")
+            or (msg.get("courier_estimated_delivery_date") or {}).get("estimated_delivery_date")
+        )
+        if estimated and len(estimated) == 10:
+            estimated = estimated + "T00:00:00+00:00"
+
+        checkpoint_message = clean(
+            latest_checkpoint.get("message")
+            or latest_checkpoint.get("subtag_message")
+            or operational_status
+        )[:1000]
+
+        telemetry_update = {
+            "status": operational_status,
+            "hub_location": location or None,
+            "status_update": checkpoint_message,
+            "carrier": carrier or None,
+            "delay_flag": delay_flag,
+            "last_updated": now_utc()
+        }
+        if estimated:
+            telemetry_update["estimated_delivery"] = estimated
+
+        supabase.table("shipment_telemetry").update(
+            telemetry_update
+        ).eq("id", telemetry_id).execute()
+
+        shipment_update = {
+            "status": operational_status,
+            "hub_location": location or None,
+            "status_update": checkpoint_message,
+            "carrier": carrier or None,
+            "updated_at": now_utc()
+        }
+        if estimated:
+            shipment_update["estimated_delivery"] = estimated
+        supabase.table("shipments").update(
+            shipment_update
+        ).eq("id", shipment["id"]).execute()
+
+        import uuid
+        provider_event_id = clean(payload.get("event_id"))
+        genrai_event_id = (
+            "aftership_" + provider_event_id
+            if provider_event_id else "aftership_" + uuid.uuid4().hex
+        )[:200]
+
+        existing = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id,status,engine_verdict")
+            .eq("event_id", genrai_event_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if existing:
+            return {
+                "success": True,
+                "duplicate": True,
+                "event_id": genrai_event_id,
+                "status": existing[0].get("status"),
+                "shipment_id": shipment["id"]
+            }
+
+        event_payload = {
+            "id": telemetry_id,
+            "shipment_id": shipment["id"],
+            "tracking_number": tracking_number,
+            "carrier": carrier,
+            "event": event_name,
+            "event_status": operational_status,
+            "location": location,
+            "delay_flag": delay_flag,
+            "dwell_hours": telemetry.get("dwell_hours"),
+            "provider": "AfterShip",
+            "provider_event_id": provider_event_id
+        }
+        supabase.table("genrai_telemetry_events").insert({
+            "event_id": genrai_event_id,
+            "source_system": "AfterShip",
+            "event_type": "SHIPMENT_TELEMETRY_UPDATE",
+            "payload": event_payload,
+            "status": "PENDING_ANALYSIS"
+        }).execute()
+
+        processed = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id,status,analyzed_at,engine_verdict,last_processing_error")
+            .eq("event_id", genrai_event_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if not processed:
+            raise RuntimeError("GENRAI event could not be read back after insertion.")
+        result = processed[0]
+
+        return {
+            "success": result.get("status") == "ANALYZED",
+            "event_id": genrai_event_id,
+            "status": result.get("status"),
+            "analyzed_at": result.get("analyzed_at"),
+            "engine_verdict": result.get("engine_verdict"),
+            "last_processing_error": result.get("last_processing_error"),
+            "shipment_id": shipment["id"],
+            "telemetry_id": telemetry_id,
+            "shipment_updated": True
+        }
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("AfterShip webhook processing failed.")
+        raise HTTPException(status_code=503, detail="AfterShip event processing failed.")
+
+
+
 # --------------------------------------------------
 
 # GENRAI-1 LOCAL RULES ENGINE
