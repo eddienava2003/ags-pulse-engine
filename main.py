@@ -340,9 +340,12 @@ async def receive_aftership_webhook(
     payload: dict,
     x_genrai_token: str = Header(default="")
 ):
-    # Configure this exact custom header in AfterShip's webhook settings.
-    # The shared secret is stored in Render as GENRAI_SYNC_TOKEN.
-    authorize_genrai(x_genrai_token)
+    # AfterShip receives a dedicated secret in its custom webhook header.
+    expected_token = os.getenv("AFTERSHIP_WEBHOOK_TOKEN", "").strip()
+    if not expected_token or not x_genrai_token or not secrets.compare_digest(
+        x_genrai_token, expected_token
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized AfterShip webhook.")
 
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="A JSON webhook object is required.")
