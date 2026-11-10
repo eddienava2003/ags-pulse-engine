@@ -222,80 +222,116 @@ async def receive_telemetry_event(
 ):
     authorize_genrai(x_genrai_token)
 
-    if not payload:
+    if not isinstance(payload, dict) or not payload:
+        raise HTTPException(status_code=400, detail="A JSON event object is required.")
+
+    event_type = clean(payload.get("event_type") or payload.get("type"))
+    if not event_type or len(event_type) > 100:
         raise HTTPException(
             status_code=400,
-            detail="Empty telemetry event."
+            detail="event_type is required and must be 100 characters or fewer."
         )
 
-    findings = []
-    signals_evaluated = []
-    invalid_fields = []
+    source_system = clean(
+        payload.get("source_system") or payload.get("source") or "AGS-Pulse-API"
+    )[:100]
+    event_id = clean(payload.get("event_id") or payload.get("id"))
+    if not event_id:
+        import uuid
+        event_id = f"api_{uuid.uuid4().hex}"
+    if len(event_id) > 200:
+        raise HTTPException(status_code=400, detail="event_id is too long.")
 
-    # DWELL-TIME EVALUATION
-
-    if "dwell_hours" in payload:
-        dwell_hours = parse_dwell_hours(
-            payload.get("dwell_hours")
+    event_payload = payload.get("payload")
+    if event_payload is None:
+        event_payload = {
+            key: value for key, value in payload.items()
+            if key not in {"event_id", "id", "event_type", "type", "source_system", "source"}
+        }
+    if not isinstance(event_payload, dict) or not event_payload:
+        raise HTTPException(
+            status_code=400,
+            detail="payload must be a non-empty JSON object containing event data."
         )
 
-        if dwell_hours is None:
-            invalid_fields.append("dwell_hours")
-        else:
-            signals_evaluated.append("dwell_time")
+    # Idempotency: a repeated event_id returns the existing result, but a
+    # reused ID with different event content is rejected.
+    try:
+        existing_result = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id,source_system,event_type,payload,status,analyzed_at,engine_verdict,last_processing_error")
+            .eq("event_id", event_id)
+            .limit(1)
+            .execute()
+        )
+        existing_rows = existing_result.data or []
+        if existing_rows:
+            existing = existing_rows[0]
+            if (
+                existing.get("source_system") != source_system
+                or existing.get("event_type") != event_type
+                or existing.get("payload") != event_payload
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="event_id already exists with different event content."
+                )
+            return {
+                "success": True,
+                "duplicate": True,
+                "event_id": existing.get("event_id"),
+                "status": existing.get("status"),
+                "engine_verdict": existing.get("engine_verdict"),
+                "last_processing_error": existing.get("last_processing_error"),
+                "persisted": True
+            }
 
-            if dwell_hours > DWELL_TIME_THRESHOLD_HOURS:
-                findings.append({
-                    "type": "EXCESSIVE_DWELL",
-                    "value": dwell_hours,
-                    "threshold": DWELL_TIME_THRESHOLD_HOURS
-                })
+        supabase.table("genrai_telemetry_events").insert({
+            "event_id": event_id,
+            "source_system": source_system,
+            "event_type": event_type,
+            "payload": event_payload,
+            "status": "PENDING_ANALYSIS"
+        }).execute()
 
-    # DELAY-FLAG EVALUATION
+        # The AFTER INSERT trigger runs the GENRAI processor and updates the
+        # same row. Re-read to report the database's actual persisted result.
+        processed_result = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id,status,received_at,analyzed_at,engine_verdict,last_processing_error")
+            .eq("event_id", event_id)
+            .limit(1)
+            .execute()
+        )
+        processed_rows = processed_result.data or []
+        if not processed_rows:
+            raise RuntimeError("Inserted event could not be read back.")
+        event = processed_rows[0]
 
-    if "delay_flag" in payload:
-        delay_flag = payload.get("delay_flag")
+        return {
+            "success": event.get("status") in {"ANALYZED", "REJECTED", "PENDING_ANALYSIS"},
+            "duplicate": False,
+            "event_id": event.get("event_id"),
+            "status": event.get("status"),
+            "received_at": event.get("received_at"),
+            "analyzed_at": event.get("analyzed_at"),
+            "engine_verdict": event.get("engine_verdict"),
+            "last_processing_error": event.get("last_processing_error"),
+            "persisted": True
+        }
 
-        if not isinstance(delay_flag, bool):
-            invalid_fields.append("delay_flag")
-        else:
-            signals_evaluated.append("delay_flag")
-
-            if delay_flag:
-                findings.append({
-                    "type": "DELAY_FLAG"
-                })
-
-    if findings:
-        state = "ALERT"
-    elif signals_evaluated:
-        state = "CLEAR"
-    else:
-        state = "UNKNOWN"
-
-    logger.info(
-        "GENRAI telemetry event received: "
-        "event_id=%s state=%s signals=%s",
-        clean(payload.get("id"))[:100],
-        state,
-        signals_evaluated
-    )
-
-    return {
-        "success": True,
-        "event_id": payload.get("id"),
-        "shipment_id": payload.get("shipment_id"),
-        "rfq_id": payload.get("rfq_id"),
-        "monitoring_state": state,
-        "signals_evaluated": signals_evaluated,
-        "invalid_fields": invalid_fields,
-        "findings": findings,
-        "database_modified": False,
-        "processed_at": now_utc()
-    }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("GENRAI telemetry event persistence failed: event_id=%s", event_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to persist or retrieve the telemetry event."
+        )
 
 
 # --------------------------------------------------
+
 # GENRAI-1 LOCAL RULES ENGINE
 # --------------------------------------------------
 
