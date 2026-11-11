@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from datetime import datetime, timezone, date
@@ -383,7 +383,40 @@ async def receive_aftership_webhook(request: Request):
     if not tracking_number:
         raise HTTPException(status_code=400, detail="AfterShip tracking_number is required.")
 
+    # Prefer the provider's event identifier. When absent, hash the exact signed
+    # body so retries of the same delivery resolve to the same GENRAI event.
+    provider_event_id = clean(
+        payload.get("event_id") or msg.get("event_id") or msg.get("id")
+    )
+    event_fingerprint = hashlib.sha256(body).hexdigest()
+    genrai_event_id = (
+        "aftership_" + provider_event_id
+        if provider_event_id else "aftership_" + event_fingerprint
+    )[:200]
+
     try:
+        # Idempotency check MUST precede all shipment/telemetry writes.
+        existing = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id,status,analyzed_at,engine_verdict,last_processing_error")
+            .eq("event_id", genrai_event_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if existing:
+            prior = existing[0]
+            prior_status = prior.get("status")
+            return {
+                "success": True,
+                "duplicate": True,
+                "event_id": genrai_event_id,
+                "status": prior_status,
+                "analyzed_at": prior.get("analyzed_at"),
+                "engine_verdict": prior.get("engine_verdict"),
+                "last_processing_error": prior.get("last_processing_error"),
+                "processing_pending": prior_status in {"PENDING_ANALYSIS", "PROCESSING"}
+            }
+
         shipment_result = (
             supabase.table("shipments")
             .select("id,tracking_number,status,carrier")
@@ -445,6 +478,20 @@ async def receive_aftership_webhook(request: Request):
             or operational_status
         )[:1000]
 
+        event_payload = {
+            "id": telemetry_id,
+            "shipment_id": shipment["id"],
+            "tracking_number": tracking_number,
+            "carrier": carrier,
+            "event": event_name,
+            "event_status": operational_status,
+            "location": location,
+            "delay_flag": delay_flag,
+            "dwell_hours": telemetry.get("dwell_hours"),
+            "provider": "AfterShip",
+            "provider_event_id": provider_event_id
+        }
+
         telemetry_update = {
             "status": operational_status,
             "hub_location": location or None,
@@ -473,42 +520,6 @@ async def receive_aftership_webhook(request: Request):
             shipment_update
         ).eq("id", shipment["id"]).execute()
 
-        import uuid
-        provider_event_id = clean(payload.get("event_id"))
-        genrai_event_id = (
-            "aftership_" + provider_event_id
-            if provider_event_id else "aftership_" + uuid.uuid4().hex
-        )[:200]
-
-        existing = (
-            supabase.table("genrai_telemetry_events")
-            .select("event_id,status,engine_verdict")
-            .eq("event_id", genrai_event_id)
-            .limit(1)
-            .execute()
-        ).data or []
-        if existing:
-            return {
-                "success": True,
-                "duplicate": True,
-                "event_id": genrai_event_id,
-                "status": existing[0].get("status"),
-                "shipment_id": shipment["id"]
-            }
-
-        event_payload = {
-            "id": telemetry_id,
-            "shipment_id": shipment["id"],
-            "tracking_number": tracking_number,
-            "carrier": carrier,
-            "event": event_name,
-            "event_status": operational_status,
-            "location": location,
-            "delay_flag": delay_flag,
-            "dwell_hours": telemetry.get("dwell_hours"),
-            "provider": "AfterShip",
-            "provider_event_id": provider_event_id
-        }
         supabase.table("genrai_telemetry_events").insert({
             "event_id": genrai_event_id,
             "source_system": "AfterShip",
@@ -527,11 +538,17 @@ async def receive_aftership_webhook(request: Request):
         if not processed:
             raise RuntimeError("GENRAI event could not be read back after insertion.")
         result = processed[0]
+        result_status = result.get("status")
+        accepted_statuses = {"ANALYZED", "REJECTED", "PENDING_ANALYSIS", "PROCESSING"}
 
         return {
-            "success": result.get("status") == "ANALYZED",
+            # PENDING_ANALYSIS/PROCESSING means accepted and queued, not failed.
+            "success": result_status in accepted_statuses,
+            "accepted": True,
+            "duplicate": False,
+            "processing_pending": result_status in {"PENDING_ANALYSIS", "PROCESSING"},
             "event_id": genrai_event_id,
-            "status": result.get("status"),
+            "status": result_status,
             "analyzed_at": result.get("analyzed_at"),
             "engine_verdict": result.get("engine_verdict"),
             "last_processing_error": result.get("last_processing_error"),
@@ -545,7 +562,6 @@ async def receive_aftership_webhook(request: Request):
     except Exception:
         logger.exception("AfterShip webhook processing failed.")
         raise HTTPException(status_code=503, detail="AfterShip event processing failed.")
-
 
 
 # --------------------------------------------------
