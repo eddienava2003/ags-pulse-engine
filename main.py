@@ -407,12 +407,17 @@ async def receive_aftership_webhook(request: Request):
         # Idempotency check happens before any shipment or telemetry mutation.
         existing = (
             supabase.table("genrai_telemetry_events")
-            .select("event_id,status,analyzed_at,engine_verdict,last_processing_error")
+            .select("event_id,status,event_type,analyzed_at,engine_verdict,last_processing_error")
             .eq("event_id", genrai_event_id)
             .limit(1)
             .execute()
         ).data or []
-        if existing:
+        unmatched_existing = bool(
+            existing
+            and existing[0].get("status") == "UNMATCHED"
+            and existing[0].get("event_type") == "AFTERSHIP_UNMATCHED"
+        )
+        if existing and not unmatched_existing:
             prior = existing[0]
             prior_status = prior.get("status")
             return {
@@ -425,6 +430,8 @@ async def receive_aftership_webhook(request: Request):
                 "last_processing_error": prior.get("last_processing_error"),
                 "processing_pending": prior_status in {"PENDING_ANALYSIS", "PROCESSING"}
             }
+        if unmatched_existing:
+            logger.info("Retrying retained unmatched AfterShip event: event_id=%s", genrai_event_id)
 
         # Internal title is accepted only when it exactly identifies an AGS
         # shipments.tracking_number. Otherwise resolve by the saved carrier map.
@@ -461,15 +468,41 @@ async def receive_aftership_webhook(request: Request):
 
         matches = internal_matches or carrier_matches
         if not matches:
+            unmatched_reason = "No shipment matched the supplied internal reference or saved carrier mapping."
+            unmatched_payload = {
+                "provider": "AfterShip",
+                "provider_event_id": provider_event_id or None,
+                "event": event_name,
+                "carrier_slug": carrier_slug or None,
+                "carrier_tracking_number": carrier_tracking_number or None,
+                "internal_reference": internal_reference or None,
+                "provider_payload": payload
+            }
+            if unmatched_existing:
+                supabase.table("genrai_telemetry_events").update({
+                    "payload": unmatched_payload,
+                    "last_processing_error": unmatched_reason
+                }).eq("event_id", genrai_event_id).eq("status", "UNMATCHED").execute()
+            else:
+                supabase.table("genrai_telemetry_events").insert({
+                    "event_id": genrai_event_id,
+                    "source_system": "AfterShip",
+                    "event_type": "AFTERSHIP_UNMATCHED",
+                    "payload": unmatched_payload,
+                    "status": "UNMATCHED",
+                    "last_processing_error": unmatched_reason
+                }).execute()
             logger.warning(
-                "AfterShip event unmatched: carrier_slug=%s carrier_tracking_number_present=%s internal_reference_present=%s",
-                carrier_slug or None, bool(carrier_tracking_number), bool(internal_reference)
+                "AfterShip event retained unmatched: event_id=%s carrier_slug=%s carrier_tracking_number_present=%s internal_reference_present=%s",
+                genrai_event_id, carrier_slug or None, bool(carrier_tracking_number), bool(internal_reference)
             )
             return {
                 "success": True,
                 "unmatched": True,
+                "persisted": True,
+                "status": "UNMATCHED",
                 "event_id": genrai_event_id,
-                "reason": "No shipment matched the supplied internal reference or saved carrier mapping."
+                "reason": unmatched_reason
             }
 
         shipment = matches[0]
@@ -559,6 +592,7 @@ async def receive_aftership_webhook(request: Request):
         timestamp = now_utc()
 
         event_payload = {
+            "id": telemetry_id,
             "shipment_id": shipment_id,
             "internal_reference": shipment.get("tracking_number"),
             "carrier_tracking_number": carrier_tracking_number or None,
@@ -606,14 +640,28 @@ async def receive_aftership_webhook(request: Request):
             shipment_update
         ).eq("id", shipment_id).execute()
 
-        # Insert the actual GENRAI event shape; DB trigger/worker owns analysis.
-        supabase.table("genrai_telemetry_events").insert({
-            "event_id": genrai_event_id,
+        # Persist or promote the provider event into the GENRAI queue.
+        # The database trigger owns analysis and shipment-verdict write-back.
+        genrai_event_record = {
             "source_system": "AfterShip",
             "event_type": "SHIPMENT_TELEMETRY_UPDATE",
             "payload": event_payload,
-            "status": "PENDING_ANALYSIS"
-        }).execute()
+            "status": "PENDING_ANALYSIS",
+            "analyzed_at": None,
+            "engine_verdict": None,
+            "last_processing_error": None,
+            "retry_attempts": 0,
+            "next_retry_at": timestamp
+        }
+        if unmatched_existing:
+            supabase.table("genrai_telemetry_events").update(
+                genrai_event_record
+            ).eq("event_id", genrai_event_id).eq("status", "UNMATCHED").execute()
+        else:
+            genrai_event_record["event_id"] = genrai_event_id
+            supabase.table("genrai_telemetry_events").insert(
+                genrai_event_record
+            ).execute()
 
         processed = (
             supabase.table("genrai_telemetry_events")
