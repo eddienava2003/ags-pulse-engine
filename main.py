@@ -14,7 +14,7 @@ import base64
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 DWELL_TIME_THRESHOLD_HOURS = 12
 MAX_AI_SHIPMENTS = 100
@@ -524,10 +524,11 @@ async def receive_aftership_webhook(request: Request):
 
         telemetry_rows = (
             supabase.table("shipment_telemetry")
-            .select("id,dwell_hours,delay_flag")
+            .select(
+                "id,dwell_hours,delay_flag,rfq_id,origin,destination,"
+                "status,hub_location,status_update,created_at,last_updated"
+            )
             .eq("shipment_id", shipment_id)
-            .order("last_updated", desc=True)
-            .limit(1)
             .execute()
         ).data or []
         if not telemetry_rows:
@@ -535,7 +536,47 @@ async def receive_aftership_webhook(request: Request):
                 status_code=409,
                 detail="Shipment has no linked telemetry row; refusing an unlinked write."
             )
-        telemetry = telemetry_rows[0]
+
+        # Resolve the production telemetry record, not merely the newest row.
+        # Test/automation rows must never receive carrier updates.
+        tracking_number = clean(shipment.get("tracking_number"))
+        valid_rows = []
+        for row in telemetry_rows:
+            row_tracking = clean(row.get("rfq_id"))
+            if row_tracking and not same_value(row_tracking, tracking_number):
+                continue
+            if not route_matches(
+                row,
+                shipment.get("origin"),
+                shipment.get("destination")
+            ):
+                continue
+
+            row_markers = " ".join([
+                clean(row.get("status")),
+                clean(row.get("hub_location")),
+                clean(row.get("status_update"))
+            ]).casefold()
+            if any(marker in row_markers for marker in (
+                "test", "automation", "e2e", "smoke"
+            )):
+                continue
+            valid_rows.append(row)
+
+        if not valid_rows:
+            raise HTTPException(
+                status_code=409,
+                detail="No production telemetry row matches this shipment; refusing an unsafe write."
+            )
+
+        # Exact AGS tracking/RFQ match wins over rows with no RFQ reference.
+        exact_tracking_rows = [
+            row for row in valid_rows
+            if same_value(row.get("rfq_id"), tracking_number)
+        ]
+        candidates = exact_tracking_rows or valid_rows
+        candidates.sort(key=safe_row_sort_key, reverse=True)
+        telemetry = candidates[0]
         telemetry_id = telemetry["id"]
 
         checkpoints = tracking_obj.get("checkpoints") or msg.get("checkpoints") or []
