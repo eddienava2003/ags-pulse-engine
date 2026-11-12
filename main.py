@@ -14,7 +14,7 @@ import base64
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 
 DWELL_TIME_THRESHOLD_HOURS = 12
 MAX_AI_SHIPMENTS = 100
@@ -164,6 +164,44 @@ def route_matches(
         return False
 
     return True
+
+
+def is_production_telemetry_row(shipment, row):
+    if clean(row.get("shipment_id")) != clean(shipment.get("id")):
+        return False
+    tracking_number = clean(shipment.get("tracking_number"))
+    row_tracking = clean(row.get("rfq_id"))
+    if row_tracking and not same_value(row_tracking, tracking_number):
+        return False
+    if not route_matches(row, shipment.get("origin"), shipment.get("destination")):
+        return False
+    row_markers = " ".join([
+        clean(row.get("status")), clean(row.get("hub_location")),
+        clean(row.get("status_update"))
+    ]).casefold()
+    if any(marker in row_markers for marker in ("test", "automation", "e2e", "smoke")):
+        return False
+    return True
+
+
+def resolve_production_telemetry_row(shipment, rows):
+    production_id = shipment.get("production_telemetry_id")
+    if production_id is not None:
+        matches = [
+            row for row in rows
+            if clean(row.get("id")) == clean(production_id)
+            and is_production_telemetry_row(shipment, row)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    # Assign legacy shipments only when one exact AGS tracking/RFQ row exists.
+    tracking_number = clean(shipment.get("tracking_number"))
+    exact_matches = [
+        row for row in rows
+        if same_value(row.get("rfq_id"), tracking_number)
+        and is_production_telemetry_row(shipment, row)
+    ]
+    return exact_matches[0] if len(exact_matches) == 1 else None
 
 
 def parse_estimated_delivery(value):
@@ -439,7 +477,7 @@ async def receive_aftership_webhook(request: Request):
         if internal_reference:
             internal_matches = (
                 supabase.table("shipments")
-                .select("id,tracking_number,status,carrier,carrier_slug,carrier_tracking_number")
+                .select("id,tracking_number,status,carrier,carrier_slug,carrier_tracking_number,production_telemetry_id")
                 .eq("tracking_number", internal_reference)
                 .execute()
             ).data or []
@@ -448,7 +486,7 @@ async def receive_aftership_webhook(request: Request):
         if carrier_tracking_number:
             carrier_query = (
                 supabase.table("shipments")
-                .select("id,tracking_number,status,carrier,carrier_slug,carrier_tracking_number")
+                .select("id,tracking_number,status,carrier,carrier_slug,carrier_tracking_number,production_telemetry_id")
                 .eq("carrier_tracking_number", carrier_tracking_number)
             )
             if carrier_slug:
@@ -522,61 +560,30 @@ async def receive_aftership_webhook(request: Request):
             if any(row.get("id") != shipment_id for row in conflicts):
                 raise HTTPException(status_code=409, detail="Carrier tracking number is already mapped to another shipment.")
 
+        production_telemetry_id = shipment.get("production_telemetry_id")
+        if production_telemetry_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Shipment has no explicit production telemetry reference."
+            )
+
         telemetry_rows = (
             supabase.table("shipment_telemetry")
             .select(
-                "id,dwell_hours,delay_flag,rfq_id,origin,destination,"
+                "id,shipment_id,dwell_hours,delay_flag,rfq_id,origin,destination,"
                 "status,hub_location,status_update,created_at,last_updated"
             )
+            .eq("id", production_telemetry_id)
             .eq("shipment_id", shipment_id)
+            .limit(2)
             .execute()
         ).data or []
-        if not telemetry_rows:
+        telemetry = resolve_production_telemetry_row(shipment, telemetry_rows)
+        if telemetry is None:
             raise HTTPException(
                 status_code=409,
-                detail="Shipment has no linked telemetry row; refusing an unlinked write."
+                detail="Explicit production telemetry reference is missing or invalid; refusing an unsafe write."
             )
-
-        # Resolve the production telemetry record, not merely the newest row.
-        # Test/automation rows must never receive carrier updates.
-        tracking_number = clean(shipment.get("tracking_number"))
-        valid_rows = []
-        for row in telemetry_rows:
-            row_tracking = clean(row.get("rfq_id"))
-            if row_tracking and not same_value(row_tracking, tracking_number):
-                continue
-            if not route_matches(
-                row,
-                shipment.get("origin"),
-                shipment.get("destination")
-            ):
-                continue
-
-            row_markers = " ".join([
-                clean(row.get("status")),
-                clean(row.get("hub_location")),
-                clean(row.get("status_update"))
-            ]).casefold()
-            if any(marker in row_markers for marker in (
-                "test", "automation", "e2e", "smoke"
-            )):
-                continue
-            valid_rows.append(row)
-
-        if not valid_rows:
-            raise HTTPException(
-                status_code=409,
-                detail="No production telemetry row matches this shipment; refusing an unsafe write."
-            )
-
-        # Exact AGS tracking/RFQ match wins over rows with no RFQ reference.
-        exact_tracking_rows = [
-            row for row in valid_rows
-            if same_value(row.get("rfq_id"), tracking_number)
-        ]
-        candidates = exact_tracking_rows or valid_rows
-        candidates.sort(key=safe_row_sort_key, reverse=True)
-        telemetry = candidates[0]
         telemetry_id = telemetry["id"]
 
         checkpoints = tracking_obj.get("checkpoints") or msg.get("checkpoints") or []
@@ -1296,7 +1303,7 @@ def execute_genrai_telemetry_sync():
 
             if not linked_rows:
 
-                (
+                inserted = (
                     supabase.table("shipment_telemetry")
                     .insert({
                         "shipment_id": shipment_id,
@@ -1310,44 +1317,40 @@ def execute_genrai_telemetry_sync():
                     })
                     .execute()
                 )
+                inserted_rows = inserted.data or []
+                if len(inserted_rows) == 1:
+                    (
+                        supabase.table("shipments")
+                        .update({"production_telemetry_id": inserted_rows[0]["id"]})
+                        .eq("id", shipment_id)
+                        .is_("production_telemetry_id", "null")
+                        .execute()
+                    )
 
                 stats["records_created"] += 1
                 continue
 
-            valid_rows = []
+            latest = resolve_production_telemetry_row(
+                shipment,
+                linked_rows
+            )
 
-            for row in linked_rows:
-
-                row_tracking = clean(row.get("rfq_id"))
-
-                if row_tracking and not same_value(
-                    row_tracking, tracking_number
-                ):
-                    continue
-
-                if not route_matches(
-                    row, origin, destination
-                ):
-                    continue
-
-                valid_rows.append(row)
-
-            if not valid_rows:
-
+            if latest is None:
                 logger.warning(
-                    "Skipped shipment %s due to tracking or route mismatch.",
+                    "Skipped shipment %s: no explicit or uniquely identifiable production telemetry row.",
                     shipment_id
                 )
-
                 stats["shipments_skipped"] += 1
                 continue
 
-            valid_rows.sort(
-                key=safe_row_sort_key,
-                reverse=True
-            )
-
-            latest = valid_rows[0]
+            if shipment.get("production_telemetry_id") is None:
+                (
+                    supabase.table("shipments")
+                    .update({"production_telemetry_id": latest["id"]})
+                    .eq("id", shipment_id)
+                    .is_("production_telemetry_id", "null")
+                    .execute()
+                )
 
             changes = {
                 "last_autonomous_check": current_time
@@ -1465,7 +1468,8 @@ def execute_genrai_autonomous_monitor():
         shipment_result = (
             supabase.table("shipments")
             .select(
-                "id,tracking_number,status,origin,destination,updated_at"
+                "id,tracking_number,status,origin,destination,updated_at,"
+                "production_telemetry_id"
             )
             .execute()
         )
@@ -1539,46 +1543,18 @@ def execute_genrai_autonomous_monitor():
                 str(shipment_id), []
             )
 
-            valid_rows = []
+            telemetry = resolve_production_telemetry_row(
+                shipment,
+                linked_rows
+            )
 
-            for row in linked_rows:
-
-                row_tracking = clean(row.get("rfq_id"))
-
-                tracking_number = clean(
-                    shipment.get("tracking_number")
-                )
-
-                if row_tracking and not same_value(
-                    row_tracking, tracking_number
-                ):
-                    continue
-
-                if not route_matches(
-                    row,
-                    shipment.get("origin"),
-                    shipment.get("destination")
-                ):
-                    continue
-
-                valid_rows.append(row)
-
-            if not valid_rows:
-
+            if telemetry is None:
                 result["missing_information"].append(
-                    "No matching telemetry record"
+                    "No explicit or uniquely identifiable production telemetry record"
                 )
-
                 report["unknown_shipments"] += 1
                 report["shipments"].append(result)
                 continue
-
-            valid_rows.sort(
-                key=safe_row_sort_key,
-                reverse=True
-            )
-
-            telemetry = valid_rows[0]
 
             required_fields = {
                 "hub_location": telemetry.get("hub_location"),
