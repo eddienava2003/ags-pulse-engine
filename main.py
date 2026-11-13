@@ -14,7 +14,7 @@ import base64
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 
 DWELL_TIME_THRESHOLD_HOURS = 12
 MAX_AI_SHIPMENTS = 100
@@ -1085,11 +1085,23 @@ def run_openai_reasoning(report):
 
 
 def execute_genrai_reasoning(report):
+    # Local reasoning is the default so GENRAI remains operational without
+    # paid API credits. OpenAI is an explicit, opt-in enhancement only.
+    _, reference_map = build_ai_input(report)
+    use_openai = os.getenv("GENRAI_USE_OPENAI", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+    if not use_openai:
+        local_result = execute_local_rules_engine(report)
+        return {
+            "success": True,
+            "analysis": local_result,
+            "shipment_reference_map": reference_map
+        }
 
     try:
-
         ai_result, reference_map = run_openai_reasoning(report)
-
         return {
             "success": True,
             "analysis": ai_result,
@@ -1097,7 +1109,6 @@ def execute_genrai_reasoning(report):
         }
 
     except Exception as exc:
-
         cause_types = []
         cause = exc
         for _ in range(4):
@@ -1120,9 +1131,6 @@ def execute_genrai_reasoning(report):
         )
 
         fallback = execute_local_rules_engine(report)
-
-        _, reference_map = build_ai_input(report)
-
         fallback["fallback_reason"] = type(exc).__name__
 
         return {
