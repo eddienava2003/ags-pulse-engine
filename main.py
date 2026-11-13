@@ -270,6 +270,58 @@ def parse_estimated_delivery(value):
         return None
 
 
+
+INTERNATIONAL_EVENT_TYPES = {
+    "CROSS_BORDER_TRANSIT",
+    "CUSTOMS_CLEARANCE",
+    "CUSTOMS_DOCUMENT_EXCEPTION",
+    "PORT_CONGESTION",
+    "MULTIMODAL_HANDOFF"
+}
+
+
+def validate_international_route_contract(event_type, event_payload):
+    """Validate optional route-correlation fields before persisting an international event."""
+    if event_type not in INTERNATIONAL_EVENT_TYPES:
+        return
+
+    international = event_payload.get("international")
+    if international is None:
+        return
+    if not isinstance(international, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="international must be a JSON object."
+        )
+
+    route_id = international.get("route_id")
+    leg_sequence = international.get("leg_sequence")
+    route_fields_present = route_id is not None or leg_sequence is not None
+    if not route_fields_present:
+        return
+
+    if not isinstance(route_id, str) or not route_id.strip() or len(route_id.strip()) > 128:
+        raise HTTPException(
+            status_code=400,
+            detail="international.route_id must be a non-empty string of at most 128 characters."
+        )
+    if isinstance(leg_sequence, bool) or not isinstance(leg_sequence, int) or not 1 <= leg_sequence <= 999999:
+        raise HTTPException(
+            status_code=400,
+            detail="international.leg_sequence must be an integer from 1 to 999999."
+        )
+
+    shipment_reference = international.get("shipment_reference")
+    if shipment_reference is not None and (
+        not isinstance(shipment_reference, str)
+        or len(shipment_reference.strip()) > 128
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="international.shipment_reference must be a string of at most 128 characters."
+        )
+
+
 def delivery_is_overdue(estimated_delivery, current_time):
     parsed = parse_estimated_delivery(estimated_delivery)
 
@@ -324,6 +376,8 @@ async def receive_telemetry_event(
             status_code=400,
             detail="payload must be a non-empty JSON object containing event data."
         )
+
+    validate_international_route_contract(event_type, event_payload)
 
     # Idempotency: a repeated event_id returns the existing result, but a
     # reused ID with different event content is rejected.
