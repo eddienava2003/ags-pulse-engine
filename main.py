@@ -80,6 +80,33 @@ def now_utc():
     return datetime.now(timezone.utc).isoformat()
 
 
+
+
+def record_genrai_progress(task_key, title, details, evidence=None, verification_result=None):
+    """Persist the latest successful autonomous-cycle result without interrupting operations."""
+    try:
+        payload = {
+            "task_key": task_key,
+            "workstream": "genrai_autonomous_operations",
+            "title": title,
+            "details": details,
+            "status": "completed",
+            "verified_at": now_utc(),
+            "verification_result": verification_result or details,
+            "evidence": evidence if isinstance(evidence, dict) else {},
+            "source": "GENRAI-1 autonomous runtime"
+        }
+        result = supabase.rpc(
+            "genrai_upsert_project_progress",
+            {"p_record": payload}
+        ).execute()
+        logger.info("GENRAI progress ledger updated: task_key=%s", task_key)
+        return result.data
+    except Exception:
+        logger.exception("GENRAI progress ledger update failed: task_key=%s", task_key)
+        return None
+
+
 def clean(value):
     if value is None:
         return ""
@@ -351,6 +378,18 @@ async def receive_telemetry_event(
         if not processed_rows:
             raise RuntimeError("Inserted event could not be read back.")
         event = processed_rows[0]
+        if event.get("status") in {"ANALYZED", "REJECTED"}:
+            record_genrai_progress(
+                "genrai-telemetry-event-processing",
+                "GENRAI telemetry event processing",
+                "Latest telemetry event processed by the GENRAI event-ingestion path.",
+                evidence={
+                    "event_id": event.get("event_id"),
+                    "event_status": event.get("status"),
+                    "analyzed_at": event.get("analyzed_at")
+                },
+                verification_result="Event verdict/status was read back from Supabase after processing."
+            )
 
         return {
             "success": event.get("status") in {"ANALYZED", "REJECTED", "PENDING_ANALYSIS"},
@@ -1413,6 +1452,15 @@ def execute_genrai_telemetry_sync():
         len(stats["errors"])
     )
 
+    if stats["success"]:
+        record_genrai_progress(
+            "genrai-telemetry-sync-cycle",
+            "GENRAI telemetry synchronization",
+            "Latest automated shipment-to-telemetry synchronization result.",
+            evidence={key: stats[key] for key in ("shipments_checked", "records_created", "records_updated", "existing_records_linked", "shipments_skipped", "completed_at")},
+            verification_result="Synchronization completed without row-level errors."
+        )
+
     return stats
 
 
@@ -1672,6 +1720,15 @@ def execute_genrai_autonomous_monitor():
         len(report["errors"])
     )
 
+    if report["success"]:
+        record_genrai_progress(
+            "genrai-autonomous-monitor-cycle",
+            "GENRAI autonomous monitoring cycle",
+            "Latest scheduled safe-mode monitoring cycle and shipment exception counts.",
+            evidence={key: report[key] for key in ("shipments_checked", "clear_shipments", "unknown_shipments", "alerts_recommended", "monitoring_completed")},
+            verification_result="Monitoring cycle completed successfully; source shipment records were not modified."
+        )
+
     return report
 
 
@@ -1731,6 +1788,18 @@ def run_intelligence_analysis(
             )
 
         reasoning = execute_genrai_reasoning(report)
+        record_genrai_progress(
+            "genrai-intelligence-analysis-cycle",
+            "GENRAI intelligence analysis cycle",
+            "Latest completed monitoring and intelligence-reasoning cycle.",
+            evidence={
+                "shipments_checked": report["shipments_checked"],
+                "alerts_recommended": report["alerts_recommended"],
+                "reasoning_completed": True,
+                "completed_at": now_utc()
+            },
+            verification_result="Monitoring and intelligence reasoning completed successfully."
+        )
 
         return {
             "message": (
