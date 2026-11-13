@@ -1095,10 +1095,21 @@ def execute_genrai_reasoning(report):
 
     except Exception as exc:
 
+        error_chain = []
+        cause = exc
+        for _ in range(4):
+            cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+            if cause is None:
+                break
+            error_chain.append(
+                f"{type(cause).__name__}: {str(cause)[:240]}"
+            )
+
         logger.warning(
-            "OpenAI reasoning unavailable. "
-            "Activating local rules engine. Error type: %s",
-            type(exc).__name__
+            "OpenAI reasoning unavailable. Activating local rules engine. "
+            "Error type: %s; underlying cause: %s",
+            type(exc).__name__,
+            " -> ".join(error_chain) if error_chain else "not exposed by SDK"
         )
 
         fallback = execute_local_rules_engine(report)
