@@ -38,6 +38,19 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  -- Preserve any risk already identified by the core telemetry processor.
+  v_severity := CASE upper(COALESCE(NEW.engine_verdict ->> 'severity', 'LOW'))
+    WHEN 'HIGH' THEN 'HIGH'
+    WHEN 'MEDIUM' THEN 'MEDIUM'
+    WHEN 'ELEVATED' THEN 'MEDIUM'
+    ELSE 'LOW'
+  END;
+  IF v_severity = 'HIGH' THEN
+    v_verdict := 'HIGH_RISK';
+  ELSIF v_severity = 'MEDIUM' THEN
+    v_verdict := 'ELEVATED_RISK';
+  END IF;
+
   v_intl := COALESCE(NEW.payload -> 'international', '{}'::jsonb);
   IF jsonb_typeof(v_intl) <> 'object' THEN
     v_intl := '{}'::jsonb;
