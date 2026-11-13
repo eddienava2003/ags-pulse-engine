@@ -1103,10 +1103,16 @@ def execute_genrai_reasoning(report):
                 break
             cause_types.append(type(cause).__name__)
 
+        # Log only structured, non-secret API error metadata.
+        # Never log exception messages, headers, request bodies, or credentials.
         logger.warning(
             "OpenAI reasoning unavailable. Activating local rules engine. "
-            "Error type: %s; cause types: %s",
+            "Error type: %s; status: %s; code: %s; param: %s; request_id: %s; cause types: %s",
             type(exc).__name__,
+            getattr(exc, "status_code", None),
+            getattr(exc, "code", None),
+            getattr(exc, "param", None),
+            getattr(exc, "request_id", None),
             " -> ".join(cause_types) if cause_types else "not exposed by SDK"
         )
 
