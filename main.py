@@ -1046,7 +1046,10 @@ def run_openai_reasoning(report):
                 "If information is insufficient, explicitly say so. "
                 "Recommendations are advisory only."
             ),
-            input=json.dumps(payload),
+            input=(
+                "Return JSON only. Analyze the following shipment data.\\n\\n"
+                + json.dumps(payload)
+            ),
             text={
                 "format": {
                     "type": "json_object"
