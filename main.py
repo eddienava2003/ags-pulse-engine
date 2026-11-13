@@ -1006,7 +1006,7 @@ def validate_ai_output(output, valid_references):
 
 def run_openai_reasoning(report):
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
 
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured.")
@@ -1095,21 +1095,19 @@ def execute_genrai_reasoning(report):
 
     except Exception as exc:
 
-        error_chain = []
+        cause_types = []
         cause = exc
         for _ in range(4):
             cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
             if cause is None:
                 break
-            error_chain.append(
-                f"{type(cause).__name__}: {str(cause)[:240]}"
-            )
+            cause_types.append(type(cause).__name__)
 
         logger.warning(
             "OpenAI reasoning unavailable. Activating local rules engine. "
-            "Error type: %s; underlying cause: %s",
+            "Error type: %s; cause types: %s",
             type(exc).__name__,
-            " -> ".join(error_chain) if error_chain else "not exposed by SDK"
+            " -> ".join(cause_types) if cause_types else "not exposed by SDK"
         )
 
         fallback = execute_local_rules_engine(report)
