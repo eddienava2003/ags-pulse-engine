@@ -14,7 +14,7 @@ import base64
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.5"
+VERSION = "1.7.6"
 
 DWELL_TIME_THRESHOLD_HOURS = 12
 MAX_AI_SHIPMENTS = 100
