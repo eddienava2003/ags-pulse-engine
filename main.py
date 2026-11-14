@@ -1298,6 +1298,92 @@ def database_health():
 
 
 # --------------------------------------------------
+# DASHBOARD AGGREGATE SUMMARY (READ-ONLY)
+# --------------------------------------------------
+
+@app.get("/dashboard/summary")
+def dashboard_summary():
+    """Expose aggregate operational counters only; never return shipment or event identifiers."""
+    try:
+        def exact_count(table_name, field="*"):
+            result = (
+                supabase.table(table_name)
+                .select(field, count="exact", head=True)
+                .execute()
+            )
+            return int(result.count or 0)
+
+        event_total = exact_count("genrai_telemetry_events", "event_id")
+        analyzed = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id", count="exact", head=True)
+            .eq("status", "ANALYZED")
+            .execute()
+        )
+        pending = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id", count="exact", head=True)
+            .eq("status", "PENDING_ANALYSIS")
+            .execute()
+        )
+        processing = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id", count="exact", head=True)
+            .eq("status", "PROCESSING")
+            .execute()
+        )
+        failed = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id", count="exact", head=True)
+            .in_("status", ["FAILED", "DEAD_LETTER"])
+            .execute()
+        )
+
+        queue_result = (
+            supabase.table("genrai_queue_health_status")
+            .select(
+                "checked_at,pending_count,processing_count,failed_count,"
+                "consumer_count,stale_consumer_count,active_alerts"
+            )
+            .limit(1)
+            .execute()
+        )
+        queue = (queue_result.data or [None])[0]
+
+        return {
+            "generated_at": now_utc(),
+            "scope": "aggregate_only",
+            "shipments": {
+                "records_total": exact_count("shipments", "id"),
+                "telemetry_records_total": exact_count("shipment_telemetry", "id")
+            },
+            "telemetry_events": {
+                "total": event_total,
+                "analyzed": int(analyzed.count or 0),
+                "pending": int(pending.count or 0),
+                "processing": int(processing.count or 0),
+                "failed_or_dead_letter": int(failed.count or 0)
+            },
+            "queue": {
+                "available": bool(queue),
+                "checked_at": queue.get("checked_at") if queue else None,
+                "pending": queue.get("pending_count") if queue else None,
+                "processing": queue.get("processing_count") if queue else None,
+                "failed": queue.get("failed_count") if queue else None,
+                "consumers": queue.get("consumer_count") if queue else None,
+                "stale_consumers": queue.get("stale_consumer_count") if queue else None,
+                "active_alerts": queue.get("active_alerts") if queue else None
+            }
+        }
+    except Exception:
+        logger.exception("Dashboard aggregate summary failed.")
+        raise HTTPException(
+            status_code=503,
+            detail="Dashboard aggregate summary is temporarily unavailable."
+        )
+
+
+# --------------------------------------------------
 # PROTECTED DATABASE TEST ENDPOINT
 # --------------------------------------------------
 
