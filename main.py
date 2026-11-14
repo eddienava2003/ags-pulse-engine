@@ -14,7 +14,7 @@ import base64
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.6"
+VERSION = "1.7.7"
 
 DWELL_TIME_THRESHOLD_HOURS = 12
 MAX_AI_SHIPMENTS = 100
@@ -39,7 +39,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-GENRAI-TOKEN"]
+    allow_headers=["Content-Type", "Authorization", "X-Organization-ID", "X-GENRAI-TOKEN"]
 )
 
 
@@ -135,6 +135,53 @@ def authorize_genrai(token):
             status_code=401,
             detail="Unauthorized."
         )
+
+
+def resolve_dashboard_organization(authorization, requested_organization_id=""):
+    """Verify the Supabase access token and require current organization membership."""
+    scheme, separator, token = clean(authorization).partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="A valid Bearer access token is required.")
+
+    try:
+        auth_response = supabase.auth.get_user(token.strip())
+        authenticated_user = getattr(auth_response, "user", None)
+        user_id = clean(getattr(authenticated_user, "id", ""))
+    except Exception:
+        logger.info("Dashboard request rejected: Supabase access-token verification failed.")
+        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+
+    try:
+        memberships = (
+            supabase.table("organization_memberships")
+            .select("organization_id")
+            .eq("user_id", user_id)
+            .execute()
+        ).data or []
+    except Exception:
+        logger.exception("Dashboard membership lookup failed.")
+        raise HTTPException(status_code=503, detail="Organization access is temporarily unavailable.")
+
+    organization_ids = list(dict.fromkeys(
+        clean(row.get("organization_id")) for row in memberships
+        if clean(row.get("organization_id"))
+    ))
+
+    requested = clean(requested_organization_id)
+    if requested:
+        if requested not in organization_ids:
+            raise HTTPException(status_code=403, detail="You are not a member of this organization.")
+        return requested
+
+    if not organization_ids:
+        raise HTTPException(status_code=403, detail="No organization membership is assigned to this account.")
+    if len(organization_ids) > 1:
+        raise HTTPException(status_code=400, detail="Select an organization to continue.")
+
+    return organization_ids[0]
 
 
 def parse_dwell_hours(value):
@@ -1302,84 +1349,61 @@ def database_health():
 # --------------------------------------------------
 
 @app.get("/dashboard/summary")
-def dashboard_summary():
-    """Expose aggregate operational counters only; never return shipment or event identifiers."""
+def dashboard_summary(
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default="")
+):
+    """Return shipment aggregates for the authenticated user's selected organization only."""
+    organization_id = resolve_dashboard_organization(
+        authorization,
+        x_organization_id
+    )
+
     try:
-        def exact_count(table_name, field="*"):
+        def tenant_count(table_name):
             result = (
                 supabase.table(table_name)
-                .select(field, count="exact", head=True)
+                .select("id", count="exact", head=True)
+                .eq("organization_id", organization_id)
                 .execute()
             )
             return int(result.count or 0)
 
-        event_total = exact_count("genrai_telemetry_events", "event_id")
-        analyzed = (
-            supabase.table("genrai_telemetry_events")
-            .select("event_id", count="exact", head=True)
-            .eq("status", "ANALYZED")
-            .execute()
-        )
-        pending = (
-            supabase.table("genrai_telemetry_events")
-            .select("event_id", count="exact", head=True)
-            .eq("status", "PENDING_ANALYSIS")
-            .execute()
-        )
-        processing = (
-            supabase.table("genrai_telemetry_events")
-            .select("event_id", count="exact", head=True)
-            .eq("status", "PROCESSING")
-            .execute()
-        )
-        failed = (
-            supabase.table("genrai_telemetry_events")
-            .select("event_id", count="exact", head=True)
-            .in_("status", ["FAILED", "DEAD_LETTER"])
-            .execute()
-        )
-
-        queue_result = (
-            supabase.table("genrai_queue_health_status")
-            .select(
-                "checked_at,pending_count,processing_count,failed_count,"
-                "consumer_count,stale_consumer_count,active_alerts"
-            )
-            .limit(1)
-            .execute()
-        )
-        queue = (queue_result.data or [None])[0]
-
         return {
             "generated_at": now_utc(),
-            "scope": "aggregate_only",
+            "scope": "organization",
+            "organization_id": organization_id,
             "shipments": {
-                "records_total": exact_count("shipments", "id"),
-                "telemetry_records_total": exact_count("shipment_telemetry", "id")
+                "records_total": tenant_count("shipments"),
+                "telemetry_records_total": tenant_count("shipment_telemetry")
             },
+            # GENRAI events and queue health are currently global tables. Do not
+            # disclose cross-tenant totals until those records carry tenant keys.
             "telemetry_events": {
-                "total": event_total,
-                "analyzed": int(analyzed.count or 0),
-                "pending": int(pending.count or 0),
-                "processing": int(processing.count or 0),
-                "failed_or_dead_letter": int(failed.count or 0)
+                "total": None,
+                "analyzed": None,
+                "pending": None,
+                "processing": None,
+                "failed_or_dead_letter": None
             },
             "queue": {
-                "available": bool(queue),
-                "checked_at": queue.get("checked_at") if queue else None,
-                "pending": queue.get("pending_count") if queue else None,
-                "processing": queue.get("processing_count") if queue else None,
-                "failed": queue.get("failed_count") if queue else None,
-                "consumers": queue.get("consumer_count") if queue else None,
-                "stale_consumers": queue.get("stale_consumer_count") if queue else None,
-                "active_alerts": queue.get("active_alerts") if queue else None
+                "available": False,
+                "checked_at": None,
+                "pending": None,
+                "processing": None,
+                "failed": None,
+                "consumers": None,
+                "stale_consumers": None,
+                "active_alerts": None
             }
         }
+    except HTTPException:
+        raise
     except Exception:
-        logger.exception("Dashboard aggregate summary failed.")
+        logger.exception("Organization dashboard summary failed.")
         raise HTTPException(
             status_code=503,
-            detail="Dashboard aggregate summary is temporarily unavailable."
+            detail="Organization dashboard summary is temporarily unavailable."
         )
 
 
