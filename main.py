@@ -1444,6 +1444,7 @@ async def create_organization_shipment(
         )
 
     shipment_id = None
+    telemetry_id = None
     try:
         # The organization ID is derived only from the verified membership.
         # Any organization_id sent in the request body is intentionally ignored.
@@ -1517,7 +1518,11 @@ async def create_organization_shipment(
         logger.exception("Organization-scoped shipment creation failed.")
         if shipment_id is not None:
             try:
-                # Best-effort rollback of the parent row if child creation failed.
+                # Remove any child row before the parent to respect the FK.
+                if telemetry_id is not None:
+                    supabase.table("shipment_telemetry").delete().eq("id", telemetry_id).eq(
+                        "shipment_id", shipment_id
+                    ).execute()
                 supabase.table("shipments").delete().eq("id", shipment_id).eq(
                     "organization_id", organization_id
                 ).execute()
