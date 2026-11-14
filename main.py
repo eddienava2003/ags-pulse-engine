@@ -647,7 +647,16 @@ async def receive_aftership_webhook(request: Request):
                     continue
             return (1, 0)
 
-        checkpoints = sorted(checkpoints, key=checkpoint_sort_key)
+        checkpoint_keys = [checkpoint_sort_key(item) for item in checkpoints]
+        # If any checkpoint lacks a usable event/ingestion timestamp, retain
+        # the provider-supplied order rather than inventing chronology.
+        if checkpoints and all(key[0] == 0 for key in checkpoint_keys):
+            checkpoints = [
+                item for _, item in sorted(
+                    zip(checkpoint_keys, checkpoints),
+                    key=lambda pair: pair[0][1]
+                )
+            ]
         latest_checkpoint = checkpoints[-1] if checkpoints else {}
 
         raw_tag = clean(
