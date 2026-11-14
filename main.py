@@ -14,7 +14,7 @@ import base64
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
 
-VERSION = "1.7.7"
+VERSION = "1.7.8"
 
 DWELL_TIME_THRESHOLD_HOURS = 12
 MAX_AI_SHIPMENTS = 100
@@ -1404,6 +1404,128 @@ def dashboard_summary(
         raise HTTPException(
             status_code=503,
             detail="Organization dashboard summary is temporarily unavailable."
+        )
+
+
+# --------------------------------------------------
+# ORGANIZATION-SCOPED SHIPMENT CREATION
+# --------------------------------------------------
+
+@app.post("/shipments", status_code=201)
+async def create_organization_shipment(
+    request: Request,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default="")
+):
+    """Create a shipment and its initial telemetry under a verified organization."""
+    organization_id = resolve_dashboard_organization(
+        authorization,
+        x_organization_id
+    )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required.")
+
+    tracking_number = clean(payload.get("tracking_number"))[:120]
+    origin = clean(payload.get("origin"))[:250]
+    destination = clean(payload.get("destination"))[:250]
+    carrier = clean(payload.get("carrier"))[:100]
+    status = clean(payload.get("status"))[:100] or "Pending"
+
+    if not tracking_number or not origin or not destination:
+        raise HTTPException(
+            status_code=422,
+            detail="tracking_number, origin, and destination are required."
+        )
+
+    shipment_id = None
+    try:
+        # The organization ID is derived only from the verified membership.
+        # Any organization_id sent in the request body is intentionally ignored.
+        shipment_result = (
+            supabase.table("shipments")
+            .insert({
+                "tracking_number": tracking_number,
+                "status": status,
+                "origin": origin,
+                "destination": destination,
+                "carrier": carrier or None,
+                "organization_id": organization_id,
+                "updated_at": now_utc()
+            })
+            .execute()
+        )
+        created_shipments = shipment_result.data or []
+        if not created_shipments:
+            raise RuntimeError("Shipment insert returned no row.")
+        shipment = created_shipments[0]
+        shipment_id = shipment["id"]
+
+        # The database trigger copies organization_id from the parent shipment.
+        telemetry_result = (
+            supabase.table("shipment_telemetry")
+            .insert({
+                "shipment_id": shipment_id,
+                "rfq_id": tracking_number,
+                "origin": origin,
+                "destination": destination,
+                "carrier": carrier or None,
+                "status": status,
+                "status_update": "Shipment created in AGS-Pulse.",
+                "delay_flag": False,
+                "dwell_hours": 0
+            })
+            .execute()
+        )
+        telemetry_rows = telemetry_result.data or []
+        if not telemetry_rows:
+            raise RuntimeError("Initial telemetry insert returned no row.")
+        telemetry_id = telemetry_rows[0]["id"]
+
+        linked = (
+            supabase.table("shipments")
+            .update({"production_telemetry_id": telemetry_id})
+            .eq("id", shipment_id)
+            .eq("organization_id", organization_id)
+            .execute()
+        )
+        if not linked.data:
+            raise RuntimeError("Initial telemetry could not be linked to the shipment.")
+
+        return {
+            "success": True,
+            "scope": "organization",
+            "organization_id": organization_id,
+            "shipment": {
+                "id": shipment_id,
+                "tracking_number": tracking_number,
+                "status": status,
+                "origin": origin,
+                "destination": destination,
+                "carrier": carrier or None
+            },
+            "telemetry_id": telemetry_id
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Organization-scoped shipment creation failed.")
+        if shipment_id is not None:
+            try:
+                # Best-effort rollback of the parent row if child creation failed.
+                supabase.table("shipments").delete().eq("id", shipment_id).eq(
+                    "organization_id", organization_id
+                ).execute()
+            except Exception:
+                logger.exception("Shipment creation rollback failed.")
+        raise HTTPException(
+            status_code=503,
+            detail="Shipment could not be created. No successful creation was confirmed."
         )
 
 
