@@ -629,9 +629,26 @@ async def receive_aftership_webhook(request: Request):
         telemetry_id = telemetry["id"]
 
         checkpoints = tracking_obj.get("checkpoints") or msg.get("checkpoints") or []
-        latest_checkpoint = checkpoints[-1] if isinstance(checkpoints, list) and checkpoints else {}
-        if not isinstance(latest_checkpoint, dict):
-            latest_checkpoint = {}
+        checkpoints = [item for item in checkpoints if isinstance(item, dict)] if isinstance(checkpoints, list) else []
+
+        # AfterShip exposes carrier event time as checkpoint_time and ingestion
+        # time as created_at. Sort explicitly; do not assume provider array order.
+        def checkpoint_sort_key(item):
+            for field in ("checkpoint_time", "created_at"):
+                raw_time = clean(item.get(field))
+                if not raw_time:
+                    continue
+                try:
+                    parsed_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+                    if parsed_time.tzinfo is None:
+                        parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+                    return (0, parsed_time.timestamp())
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            return (1, 0)
+
+        checkpoints = sorted(checkpoints, key=checkpoint_sort_key)
+        latest_checkpoint = checkpoints[-1] if checkpoints else {}
 
         raw_tag = clean(
             tracking_obj.get("tag") or tracking_obj.get("status")
@@ -681,58 +698,73 @@ async def receive_aftership_webhook(request: Request):
         )[:1000]
         timestamp = now_utc()
 
-        # Route context is operator-configured; never infer country, mode, or
-        # border activity from a free-text location or generic exception tag.
+        # A multi-leg shipment has multiple active mapping rows by design.
+        # They are legs of one route, not competing shipment mappings.
         route_mappings = (
             supabase.schema("genrai_ops")
             .table("intl_shipment_route_mappings")
-            .select("route_id,leg_sequence,origin_country,destination_country,transport_mode")
+            .select("route_id,leg_sequence,origin_country,destination_country,transport_mode,provider_slug,provider_tracking_number")
             .eq("shipment_id", shipment_id)
             .eq("active", True)
             .eq("provider", "AfterShip")
-            .limit(2)
+            .order("leg_sequence")
+            .limit(100)
             .execute()
         ).data or []
-        if len(route_mappings) > 1:
+        route_ids = {clean(row.get("route_id")) for row in route_mappings if clean(row.get("route_id"))}
+        if len(route_ids) > 1:
             raise HTTPException(
                 status_code=409,
-                detail="Multiple active AfterShip international route mappings exist for this shipment."
+                detail="Shipment has multiple active AfterShip route IDs; operator route selection is required."
             )
-        route_mapping = route_mappings[0] if route_mappings else None
+        leg_sequences = [row.get("leg_sequence") for row in route_mappings]
+        if len(leg_sequences) != len(set(leg_sequences)):
+            raise HTTPException(
+                status_code=409,
+                detail="Active AfterShip route contains duplicate leg_sequence values."
+            )
 
-        # Only emit a CROSS_BORDER_TRANSIT event when two consecutive
-        # AfterShip checkpoints explicitly show origin-country -> destination-
-        # country movement. AfterShip uses ISO alpha-3 country codes.
+        # AfterShip's current checkpoint country field is country_region
+        # (ISO alpha-3); retain legacy aliases for older webhook versions.
         iso2_to_iso3 = {
             "US": "USA", "MX": "MEX", "CA": "CAN", "GB": "GBR",
             "DE": "DEU", "FR": "FRA", "ES": "ESP", "IT": "ITA",
             "NL": "NLD", "BE": "BEL", "CN": "CHN", "JP": "JPN",
             "KR": "KOR", "AU": "AUS", "BR": "BRA", "IN": "IND"
         }
+
+        def normalize_country(value):
+            code = clean(value).upper()
+            return iso2_to_iso3.get(code, code)
+
         international_context = None
-        if route_mapping and isinstance(checkpoints, list) and len(checkpoints) >= 2:
+        if route_mappings and len(checkpoints) >= 2:
             previous_checkpoint = checkpoints[-2]
-            if not isinstance(previous_checkpoint, dict):
-                previous_checkpoint = {}
-            previous_country = clean(
-                previous_checkpoint.get("country_iso3")
+            previous_country = normalize_country(
+                previous_checkpoint.get("country_region")
+                or previous_checkpoint.get("country_iso3")
                 or previous_checkpoint.get("country_code")
-            ).upper()
-            current_country = clean(
-                latest_checkpoint.get("country_iso3")
+            )
+            current_country = normalize_country(
+                latest_checkpoint.get("country_region")
+                or latest_checkpoint.get("country_iso3")
                 or latest_checkpoint.get("country_code")
-            ).upper()
-            origin_iso3 = iso2_to_iso3.get(
-                clean(route_mapping.get("origin_country")).upper()
             )
-            destination_iso3 = iso2_to_iso3.get(
-                clean(route_mapping.get("destination_country")).upper()
-            )
-            if (
-                origin_iso3 and destination_iso3
-                and previous_country == origin_iso3
-                and current_country == destination_iso3
-            ):
+
+            # Match the newest chronological checkpoint transition to its
+            # specific route leg. Multiple rows for one route are expected.
+            matching_legs = [
+                row for row in route_mappings
+                if normalize_country(row.get("origin_country")) == previous_country
+                and normalize_country(row.get("destination_country")) == current_country
+            ]
+            if len(matching_legs) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Latest AfterShip country transition matches multiple route legs."
+                )
+            if matching_legs:
+                route_mapping = matching_legs[0]
                 international_context = {
                     "route_id": route_mapping["route_id"],
                     "shipment_reference": shipment.get("tracking_number"),
