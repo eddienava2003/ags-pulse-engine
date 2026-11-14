@@ -710,15 +710,10 @@ async def receive_aftership_webhook(request: Request):
         # A multi-leg shipment has multiple active mapping rows by design.
         # They are legs of one route, not competing shipment mappings.
         route_mappings = (
-            supabase.schema("genrai_ops")
-            .table("intl_shipment_route_mappings")
-            .select("route_id,leg_sequence,origin_country,destination_country,transport_mode,provider_slug,provider_tracking_number")
-            .eq("shipment_id", shipment_id)
-            .eq("active", True)
-            .eq("provider", "AfterShip")
-            .order("leg_sequence")
-            .limit(100)
-            .execute()
+            supabase.rpc(
+                "get_active_aftership_route_mappings",
+                {"p_shipment_id": shipment_id}
+            ).execute()
         ).data or []
         route_ids = {clean(row.get("route_id")) for row in route_mappings if clean(row.get("route_id"))}
         if len(route_ids) > 1:
