@@ -681,6 +681,69 @@ async def receive_aftership_webhook(request: Request):
         )[:1000]
         timestamp = now_utc()
 
+        # Route context is operator-configured; never infer country, mode, or
+        # border activity from a free-text location or generic exception tag.
+        route_mappings = (
+            supabase.schema("genrai_ops")
+            .table("intl_shipment_route_mappings")
+            .select("route_id,leg_sequence,origin_country,destination_country,transport_mode")
+            .eq("shipment_id", shipment_id)
+            .eq("active", True)
+            .eq("provider", "AfterShip")
+            .limit(2)
+            .execute()
+        ).data or []
+        if len(route_mappings) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Multiple active AfterShip international route mappings exist for this shipment."
+            )
+        route_mapping = route_mappings[0] if route_mappings else None
+
+        # Only emit a CROSS_BORDER_TRANSIT event when two consecutive
+        # AfterShip checkpoints explicitly show origin-country -> destination-
+        # country movement. AfterShip uses ISO alpha-3 country codes.
+        iso2_to_iso3 = {
+            "US": "USA", "MX": "MEX", "CA": "CAN", "GB": "GBR",
+            "DE": "DEU", "FR": "FRA", "ES": "ESP", "IT": "ITA",
+            "NL": "NLD", "BE": "BEL", "CN": "CHN", "JP": "JPN",
+            "KR": "KOR", "AU": "AUS", "BR": "BRA", "IN": "IND"
+        }
+        international_context = None
+        if route_mapping and isinstance(checkpoints, list) and len(checkpoints) >= 2:
+            previous_checkpoint = checkpoints[-2]
+            if not isinstance(previous_checkpoint, dict):
+                previous_checkpoint = {}
+            previous_country = clean(
+                previous_checkpoint.get("country_iso3")
+                or previous_checkpoint.get("country_code")
+            ).upper()
+            current_country = clean(
+                latest_checkpoint.get("country_iso3")
+                or latest_checkpoint.get("country_code")
+            ).upper()
+            origin_iso3 = iso2_to_iso3.get(
+                clean(route_mapping.get("origin_country")).upper()
+            )
+            destination_iso3 = iso2_to_iso3.get(
+                clean(route_mapping.get("destination_country")).upper()
+            )
+            if (
+                origin_iso3 and destination_iso3
+                and previous_country == origin_iso3
+                and current_country == destination_iso3
+            ):
+                international_context = {
+                    "route_id": route_mapping["route_id"],
+                    "shipment_reference": shipment.get("tracking_number"),
+                    "origin_country": route_mapping["origin_country"],
+                    "destination_country": route_mapping["destination_country"],
+                    "transport_mode": route_mapping["transport_mode"],
+                    "leg_sequence": route_mapping["leg_sequence"],
+                    "leg_status": operational_status[:100],
+                    "handoff_status": "UNKNOWN"
+                }
+
         event_payload = {
             "id": telemetry_id,
             "shipment_id": shipment_id,
@@ -696,6 +759,8 @@ async def receive_aftership_webhook(request: Request):
             "provider": "AfterShip",
             "provider_event_id": provider_event_id or None
         }
+        if international_context:
+            event_payload["international"] = international_context
 
         telemetry_update = {
             "status": operational_status,
@@ -734,7 +799,10 @@ async def receive_aftership_webhook(request: Request):
         # The database trigger owns analysis and shipment-verdict write-back.
         genrai_event_record = {
             "source_system": "AfterShip",
-            "event_type": "SHIPMENT_TELEMETRY_UPDATE",
+            "event_type": (
+                "CROSS_BORDER_TRANSIT"
+                if international_context else "SHIPMENT_TELEMETRY_UPDATE"
+            ),
             "payload": event_payload,
             "status": "PENDING_ANALYSIS",
             "analyzed_at": None,
