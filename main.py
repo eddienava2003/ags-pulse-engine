@@ -1447,6 +1447,40 @@ def list_organization_genrai_events(
             .execute()
         )
         rows = result.data or []
+        shipment_ids = []
+        for event in rows:
+            event_payload = event.get("payload")
+            if not isinstance(event_payload, dict):
+                continue
+            try:
+                shipment_id = int(event_payload.get("shipment_id"))
+                shipment_ids.append(shipment_id)
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+        shipments_by_id = {}
+        if shipment_ids:
+            tenant_shipments = (
+                supabase.table("shipments")
+                .select("id,tracking_number,status,origin,destination,carrier,hub_location,status_update,estimated_delivery,updated_at")
+                .eq("organization_id", organization_id)
+                .in_("id", list(dict.fromkeys(shipment_ids)))
+                .execute()
+            ).data or []
+            shipments_by_id = {shipment.get("id"): shipment for shipment in tenant_shipments}
+
+        # Attach shipment context only after a second organization-scoped
+        # lookup. Event payload references alone never authorize shipment data.
+        for event in rows:
+            event_payload = event.get("payload")
+            shipment = None
+            if isinstance(event_payload, dict):
+                try:
+                    shipment = shipments_by_id.get(int(event_payload.get("shipment_id")))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            event["shipment"] = shipment
+
         total = int(result.count or 0)
         return {
             "success": True,
