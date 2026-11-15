@@ -566,7 +566,7 @@ async def receive_aftership_webhook(request: Request):
         if internal_reference:
             internal_matches = (
                 supabase.table("shipments")
-                .select("id,tracking_number,status,origin,destination,carrier,carrier_slug,carrier_tracking_number,production_telemetry_id")
+                .select("id,tracking_number,status,origin,destination,carrier,carrier_slug,carrier_tracking_number,production_telemetry_id,organization_id")
                 .eq("tracking_number", internal_reference)
                 .execute()
             ).data or []
@@ -575,7 +575,7 @@ async def receive_aftership_webhook(request: Request):
         if carrier_tracking_number:
             carrier_query = (
                 supabase.table("shipments")
-                .select("id,tracking_number,status,origin,destination,carrier,carrier_slug,carrier_tracking_number,production_telemetry_id")
+                .select("id,tracking_number,status,origin,destination,carrier,carrier_slug,carrier_tracking_number,production_telemetry_id,organization_id")
                 .eq("carrier_tracking_number", carrier_tracking_number)
             )
             if carrier_slug:
@@ -881,6 +881,7 @@ async def receive_aftership_webhook(request: Request):
         # Persist or promote the provider event into the GENRAI queue.
         # The database trigger owns analysis and shipment-verdict write-back.
         genrai_event_record = {
+            "organization_id": shipment.get("organization_id"),
             "source_system": "AfterShip",
             "event_type": (
                 "CROSS_BORDER_TRANSIT"
