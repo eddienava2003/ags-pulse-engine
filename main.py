@@ -1614,6 +1614,126 @@ def list_organization_shipments(
         logger.exception("Organization shipment list failed.")
         raise HTTPException(status_code=503, detail="Organization shipment list is temporarily unavailable.")
 
+# ORGANIZATION-SCOPED MANUAL SHIPMENT CHECKPOINTS
+# --------------------------------------------------
+
+@app.get("/shipment-checkpoints")
+def list_shipment_checkpoints(
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+    shipment_id: int = 0,
+    limit: int = 100
+):
+    """List real checkpoint history for shipments owned by the verified organization."""
+    organization_id = resolve_dashboard_organization(authorization, x_organization_id)
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 200.")
+    try:
+        query = (
+            supabase.table("shipment_checkpoints")
+            .select("id,shipment_id,organization_id,checkpoint_time,location,status,message,source,created_by,created_at")
+            .eq("organization_id", organization_id)
+        )
+        if shipment_id:
+            query = query.eq("shipment_id", shipment_id)
+        result = query.order("checkpoint_time", desc=True).limit(limit).execute()
+        return {
+            "success": True,
+            "scope": "organization",
+            "organization_id": organization_id,
+            "items": result.data or []
+        }
+    except Exception:
+        logger.exception("Organization shipment checkpoint list failed.")
+        raise HTTPException(status_code=503, detail="Shipment checkpoint history is temporarily unavailable.")
+
+
+@app.post("/shipment-checkpoints", status_code=201)
+async def create_shipment_checkpoint(
+    request: Request,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default="")
+):
+    """Create a manual checkpoint only after verifying user role and shipment ownership."""
+    organization_id = resolve_dashboard_organization(authorization, x_organization_id)
+    scheme, separator, token = clean(authorization).partition(" ")
+    if not separator or scheme.casefold() != "bearer":
+        raise HTTPException(status_code=401, detail="A valid Bearer access token is required.")
+    try:
+        auth_response = supabase.auth.get_user(token.strip())
+        user_id = clean(getattr(getattr(auth_response, "user", None), "id", ""))
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+        membership = (
+            supabase.table("organization_memberships")
+            .select("member_role")
+            .eq("organization_id", organization_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        role = clean(membership[0].get("member_role")) if membership else ""
+        if role not in {"owner", "admin", "dispatcher", "member"}:
+            raise HTTPException(status_code=403, detail="Your organization role cannot create checkpoints.")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Checkpoint authorization failed.")
+        raise HTTPException(status_code=503, detail="Checkpoint authorization is temporarily unavailable.")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required.")
+
+    try:
+        shipment_id = int(payload.get("shipment_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="shipment_id must be a valid shipment ID.")
+    location = clean(payload.get("location"))[:250]
+    status = clean(payload.get("status"))[:100]
+    message = clean(payload.get("message"))[:2000] or None
+    checkpoint_time = clean(payload.get("checkpoint_time")) or now_utc()
+    if not location or not status:
+        raise HTTPException(status_code=422, detail="location and status are required.")
+    try:
+        shipment = (
+            supabase.table("shipments")
+            .select("id")
+            .eq("id", shipment_id)
+            .eq("organization_id", organization_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if not shipment:
+            raise HTTPException(status_code=404, detail="Shipment not found in the selected organization.")
+        result = (
+            supabase.table("shipment_checkpoints")
+            .insert({
+                "shipment_id": shipment_id,
+                "organization_id": organization_id,
+                "checkpoint_time": checkpoint_time,
+                "location": location,
+                "status": status,
+                "message": message,
+                "source": "manual",
+                "created_by": user_id
+            })
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            raise RuntimeError("Checkpoint insert returned no row.")
+        return {"success": True, "scope": "organization", "organization_id": organization_id, "checkpoint": rows[0]}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Organization shipment checkpoint creation failed.")
+        raise HTTPException(status_code=503, detail="Checkpoint could not be saved.")
+
+
 # ORGANIZATION-SCOPED SHIPMENT CREATION
 # --------------------------------------------------
 
