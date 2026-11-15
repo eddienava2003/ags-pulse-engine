@@ -1369,6 +1369,17 @@ def dashboard_summary(
             )
             return int(result.count or 0)
 
+        def tenant_event_count(statuses=None):
+            query = (
+                supabase.table("genrai_telemetry_events")
+                .select("event_id", count="exact", head=True)
+                .eq("organization_id", organization_id)
+            )
+            if statuses:
+                query = query.in_("status", statuses)
+            result = query.execute()
+            return int(result.count or 0)
+
         return {
             "generated_at": now_utc(),
             "scope": "organization",
@@ -1377,15 +1388,15 @@ def dashboard_summary(
                 "records_total": tenant_count("shipments"),
                 "telemetry_records_total": tenant_count("shipment_telemetry")
             },
-            # GENRAI events and queue health are currently global tables. Do not
-            # disclose cross-tenant totals until those records carry tenant keys.
             "telemetry_events": {
-                "total": None,
-                "analyzed": None,
-                "pending": None,
-                "processing": None,
-                "failed_or_dead_letter": None
+                "available": True,
+                "total": tenant_event_count(),
+                "analyzed": tenant_event_count(["ANALYZED"]),
+                "pending": tenant_event_count(["PENDING_ANALYSIS"]),
+                "processing": tenant_event_count(["PROCESSING"]),
+                "failed_or_dead_letter": tenant_event_count(["FAILED", "DEAD_LETTER"])
             },
+            # Queue-health tables remain global/unlinked; keep their metrics hidden.
             "queue": {
                 "available": False,
                 "checked_at": None,
