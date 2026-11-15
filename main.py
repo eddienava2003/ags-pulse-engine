@@ -1528,15 +1528,19 @@ def list_organization_route_assessments(
         if mapped_shipment_ids:
             tenant_shipments = (
                 supabase.table("shipments")
-                .select("id")
+                .select("id,tracking_number")
                 .eq("organization_id", organization_id)
                 .in_("id", mapped_shipment_ids)
                 .execute()
             ).data or []
-            tenant_shipment_ids = {row.get("id") for row in tenant_shipments}
+            tenant_shipments_by_id = {
+                row.get("id"): row for row in tenant_shipments if row.get("id") is not None
+            }
+        else:
+            tenant_shipments_by_id = {}
         mappings = [
             row for row in mappings
-            if row.get("shipment_id") in tenant_shipment_ids
+            if row.get("shipment_id") in tenant_shipments_by_id
         ]
         route_ids = list(dict.fromkeys(row.get("route_id") for row in mappings if row.get("route_id")))
         assessments = []
@@ -1553,7 +1557,14 @@ def list_organization_route_assessments(
         items = []
         for mapping in mappings:
             assessment = assessment_by_route.get(mapping.get("route_id"))
-            if assessment:
+            shipment = tenant_shipments_by_id.get(mapping.get("shipment_id"))
+            # Assessments are accepted only when their shipment reference
+            # matches the verified tenant-owned shipment behind this mapping.
+            if (
+                assessment
+                and shipment
+                and clean(assessment.get("shipment_reference")) == clean(shipment.get("tracking_number"))
+            ):
                 items.append({"mapping": mapping, "assessment": assessment})
         return {"success": True, "scope": "organization", "organization_id": organization_id, "items": items, "total": len(items)}
     except HTTPException:
