@@ -1421,6 +1421,45 @@ def dashboard_summary(
 
 # --------------------------------------------------
 # --------------------------------------------------
+# ORGANIZATION-SCOPED GENRAI EVENT FEED (READ-ONLY)
+# --------------------------------------------------
+
+@app.get("/genrai/events")
+def list_organization_genrai_events(
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+    limit: int = 50,
+    offset: int = 0
+):
+    """Return recent GENRAI events linked to the verified organization only."""
+    organization_id = resolve_dashboard_organization(authorization, x_organization_id)
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100.")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be zero or greater.")
+    try:
+        result = (
+            supabase.table("genrai_telemetry_events")
+            .select("event_id,source_system,event_type,status,received_at,analyzed_at,engine_verdict", count="exact")
+            .eq("organization_id", organization_id)
+            .order("received_at", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        rows = result.data or []
+        total = int(result.count or 0)
+        return {
+            "success": True,
+            "scope": "organization",
+            "organization_id": organization_id,
+            "items": rows,
+            "pagination": {"limit": limit, "offset": offset, "total": total, "has_more": offset + len(rows) < total}
+        }
+    except Exception:
+        logger.exception("Organization GENRAI event feed failed.")
+        raise HTTPException(status_code=503, detail="Organization GENRAI event feed is temporarily unavailable.")
+
+# --------------------------------------------------
 # ORGANIZATION-SCOPED SHIPMENT LIST (READ-ONLY)
 # --------------------------------------------------
 
