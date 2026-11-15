@@ -1440,7 +1440,7 @@ def list_organization_genrai_events(
     try:
         result = (
             supabase.table("genrai_telemetry_events")
-            .select("event_id,source_system,event_type,status,received_at,analyzed_at,engine_verdict", count="exact")
+            .select("event_id,source_system,event_type,status,received_at,analyzed_at,engine_verdict,payload", count="exact")
             .eq("organization_id", organization_id)
             .order("received_at", desc=True)
             .range(offset, offset + limit - 1)
@@ -1484,6 +1484,26 @@ def list_organization_route_assessments(
             .limit(limit)
             .execute()
         ).data or []
+        # Enforce tenant ownership on both sides of the mapping. A stale or
+        # incorrectly assigned route mapping must never expose another
+        # organization's shipment or assessment.
+        mapped_shipment_ids = list(dict.fromkeys(
+            row.get("shipment_id") for row in mappings if row.get("shipment_id") is not None
+        ))
+        tenant_shipment_ids = set()
+        if mapped_shipment_ids:
+            tenant_shipments = (
+                supabase.table("shipments")
+                .select("id")
+                .eq("organization_id", organization_id)
+                .in_("id", mapped_shipment_ids)
+                .execute()
+            ).data or []
+            tenant_shipment_ids = {row.get("id") for row in tenant_shipments}
+        mappings = [
+            row for row in mappings
+            if row.get("shipment_id") in tenant_shipment_ids
+        ]
         route_ids = list(dict.fromkeys(row.get("route_id") for row in mappings if row.get("route_id")))
         assessments = []
         if route_ids:
