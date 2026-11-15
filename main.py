@@ -1460,6 +1460,55 @@ def list_organization_genrai_events(
         raise HTTPException(status_code=503, detail="Organization GENRAI event feed is temporarily unavailable.")
 
 # --------------------------------------------------
+# ORGANIZATION-SCOPED INTERNATIONAL ROUTE ASSESSMENTS
+# --------------------------------------------------
+
+@app.get("/genrai/routes/assessments")
+def list_organization_route_assessments(
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+    limit: int = 50
+):
+    """Return assessments only for route mappings owned by the verified organization."""
+    organization_id = resolve_dashboard_organization(authorization, x_organization_id)
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100.")
+    try:
+        mappings = (
+            supabase.schema("genrai_ops")
+            .table("intl_shipment_route_mappings")
+            .select("route_id,shipment_id,leg_sequence,origin_country,destination_country,transport_mode,provider,active")
+            .eq("organization_id", organization_id)
+            .eq("active", True)
+            .order("updated_at", desc=True)
+            .limit(limit)
+            .execute()
+        ).data or []
+        route_ids = list(dict.fromkeys(row.get("route_id") for row in mappings if row.get("route_id")))
+        assessments = []
+        if route_ids:
+            assessments = (
+                supabase.schema("genrai_ops")
+                .table("intl_route_assessments")
+                .select("route_id,shipment_reference,total_legs,sequenced_legs,sequence_gaps,route_risk_score,risk_band,findings,route_summary,source_event_count,assessed_at")
+                .in_("route_id", route_ids)
+                .order("assessed_at", desc=True)
+                .execute()
+            ).data or []
+        assessment_by_route = {row.get("route_id"): row for row in assessments}
+        items = []
+        for mapping in mappings:
+            assessment = assessment_by_route.get(mapping.get("route_id"))
+            if assessment:
+                items.append({"mapping": mapping, "assessment": assessment})
+        return {"success": True, "scope": "organization", "organization_id": organization_id, "items": items, "total": len(items)}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Organization route assessment feed failed.")
+        raise HTTPException(status_code=503, detail="Organization route assessments are temporarily unavailable.")
+
+# --------------------------------------------------
 # ORGANIZATION-SCOPED SHIPMENT LIST (READ-ONLY)
 # --------------------------------------------------
 
