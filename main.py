@@ -1420,6 +1420,45 @@ def dashboard_summary(
 
 
 # --------------------------------------------------
+# --------------------------------------------------
+# ORGANIZATION-SCOPED SHIPMENT LIST (READ-ONLY)
+# --------------------------------------------------
+
+@app.get("/shipments")
+def list_organization_shipments(
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+    limit: int = 25,
+    offset: int = 0
+):
+    """Return a paginated shipment list for a verified organization member."""
+    organization_id = resolve_dashboard_organization(authorization, x_organization_id)
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100.")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be zero or greater.")
+    try:
+        result = (
+            supabase.table("shipments")
+            .select("id,tracking_number,status,origin,destination,carrier,hub_location,status_update,estimated_delivery,updated_at,production_telemetry_id", count="exact")
+            .eq("organization_id", organization_id)
+            .order("updated_at", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        rows = result.data or []
+        total = int(result.count or 0)
+        return {
+            "success": True,
+            "scope": "organization",
+            "organization_id": organization_id,
+            "items": rows,
+            "pagination": {"limit": limit, "offset": offset, "total": total, "has_more": offset + len(rows) < total}
+        }
+    except Exception:
+        logger.exception("Organization shipment list failed.")
+        raise HTTPException(status_code=503, detail="Organization shipment list is temporarily unavailable.")
+
 # ORGANIZATION-SCOPED SHIPMENT CREATION
 # --------------------------------------------------
 
