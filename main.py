@@ -1397,13 +1397,15 @@ def dashboard_summary(
                 "processing": tenant_event_count(["PROCESSING"]),
                 "failed_or_dead_letter": tenant_event_count(["FAILED", "DEAD_LETTER"])
             },
-            # Queue-health tables remain global/unlinked; keep their metrics hidden.
+            # Expose only queue-state counts derived from this organization's
+            # own telemetry events. Global worker/consumer internals stay private.
             "queue": {
-                "available": False,
-                "checked_at": None,
-                "pending": None,
-                "processing": None,
-                "failed": None,
+                "available": True,
+                "scope": "organization",
+                "checked_at": now_utc(),
+                "pending": tenant_event_count(["PENDING_ANALYSIS"]),
+                "processing": tenant_event_count(["PROCESSING"]),
+                "failed": tenant_event_count(["FAILED", "DEAD_LETTER"]),
                 "consumers": None,
                 "stale_consumers": None,
                 "active_alerts": None
