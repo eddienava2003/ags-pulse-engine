@@ -1511,8 +1511,7 @@ def list_organization_route_assessments(
         raise HTTPException(status_code=422, detail="limit must be between 1 and 100.")
     try:
         mappings = (
-            supabase.schema("genrai_ops")
-            .table("intl_shipment_route_mappings")
+            supabase.table("genrai_intl_shipment_route_mappings_api")
             .select("route_id,shipment_id,leg_sequence,origin_country,destination_country,transport_mode,provider,active")
             .eq("organization_id", organization_id)
             .eq("active", True)
@@ -1548,8 +1547,7 @@ def list_organization_route_assessments(
         assessments = []
         if route_ids:
             assessments = (
-                supabase.schema("genrai_ops")
-                .table("intl_route_assessments")
+                supabase.table("genrai_intl_route_assessments_api")
                 .select("route_id,shipment_reference,total_legs,sequenced_legs,sequence_gaps,route_risk_score,risk_band,findings,route_summary,source_event_count,assessed_at")
                 .in_("route_id", route_ids)
                 .order("assessed_at", desc=True)
