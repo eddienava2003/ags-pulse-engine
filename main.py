@@ -2317,7 +2317,7 @@ def execute_genrai_autonomous_monitor():
             supabase.table("shipment_telemetry")
             .select(
                 "id,shipment_id,rfq_id,hub_location,"
-                "status_update,estimated_delivery,"
+                "status,carrier,status_update,estimated_delivery,"
                 "delay_flag,dwell_hours,delay_reason,"
                 "last_updated,last_autonomous_check,"
                 "created_at"
