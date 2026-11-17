@@ -131,6 +131,121 @@ def _valid_file_signature(mime: str, data: bytes) -> bool:
     return signatures.get(mime, False)
 
 
+def _hs_code_format_check(value: str):
+    code = re.sub(r"[ .-]", "", str(value or ""))
+    if not code.isdigit():
+        return {"valid_format": False, "normalized_code": code, "message": "HS code must contain digits only."}
+    if len(code) not in {6, 8, 10}:
+        return {"valid_format": False, "normalized_code": code, "message": "HS code must contain 6, 8, or 10 digits."}
+    return {
+        "valid_format": True,
+        "normalized_code": code,
+        "hs_level": {6: "international_harmonized", 8: "national_or_regional", 10: "national_tariff_line"}[len(code)],
+        "message": "Format accepted. Official tariff schedule and product classification have not been verified.",
+    }
+
+
+@router.get("/customs/orders/{order_id}/readiness")
+def get_customs_document_readiness(
+    order_id: str,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+):
+    db, _, org_id = _auth_context(authorization, x_organization_id)
+    orders = (
+        db.table("trade_orders").select("*").eq("id", order_id)
+        .eq("organization_id", org_id).limit(1).execute()
+    ).data or []
+    if not orders:
+        raise HTTPException(status_code=404, detail="Trade order not found.")
+    order = orders[0]
+    items = (
+        db.table("trade_order_items").select("*").eq("order_id", order_id)
+        .eq("organization_id", org_id).execute()
+    ).data or []
+    documents = (
+        db.table("trade_documents").select("id,document_type,status,title")
+        .eq("order_id", order_id).eq("organization_id", org_id).execute()
+    ).data or []
+
+    missing_order_fields = [
+        field for field in ("buyer_name", "buyer_country", "seller_name", "seller_country", "currency_code", "incoterms")
+        if not str(order.get(field) or "").strip()
+    ]
+    item_checks = []
+    for item in items:
+        missing = [
+            field for field in ("description", "hs_code", "country_of_origin", "quantity", "unit_of_measure", "unit_price")
+            if item.get(field) is None or (isinstance(item.get(field), str) and not item.get(field).strip())
+        ]
+        hs_check = _hs_code_format_check(item.get("hs_code") or "")
+        item_checks.append({
+            "item_id": item.get("id),
+            "description": item.get("description"),
+            "missing_fields": missing,
+            "hs_code_format": hs_check,
+            "complete": not missing and hs_check["valid_format"],
+        })
+
+    approved_types = {row.get("document_type") for row in documents if row.get("status") == "APPROVED"}
+    required_documents = ["COMMERCIAL_INVOICE", "PACKING_LIST"]
+    missing_documents = [doc_type for doc_type in required_documents if doc_type not in approved_types]
+    if str(order.get("buyer_country") or "").casefold() != str(order.get("seller_country") or "").casefold():
+        if "CERTIFICATE_OF_ORIGIN" not in approved_types:
+            missing_documents.append("CERTIFICATE_OF_ORIGIN")
+
+    blockers = []
+    if missing_order_fields:
+        blockers.append({"category": "ORDER_DATA", "missing_fields": missing_order_fields})
+    if not items:
+        blockers.append({"category": "LINE_ITEMS", "message": "At least one trade order item is required."})
+    for check in item_checks:
+        if not check["complete"]:
+            blockers.append({"category": "LINE_ITEM", "item_id": check["item_id"], "missing_fields": check["missing_fields"], "hs_code_format": check["hs_code_format"]})
+    if missing_documents:
+        blockers.append({"category": "DOCUMENTS", "missing_approved_documents": missing_documents})
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "readiness": "READY_FOR_HUMAN_CUSTOMS_REVIEW" if not blockers else "BLOCKED",
+        "blocker_count": len(blockers),
+        "blockers": blockers,
+        "line_items": item_checks,
+        "document_statuses": documents,
+        "important_notice": "Readiness checks completeness and HS-code format only. It does not verify tariff classification, duty rates, origin eligibility, sanctions, or customs compliance.",
+    }
+
+
+@router.post("/customs/hs-code/validate")
+def validate_customs_hs_code(
+    payload: dict,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+):
+    _db, _, _org_id = _auth_context(authorization, x_organization_id)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="A JSON object is required.")
+    code_result = _hs_code_format_check(payload.get("hs_code") or "")
+    description = str(payload.get("product_description") or "").strip()
+    import_country = str(payload.get("import_country") or "").strip()
+    origin_country = str(payload.get("country_of_origin") or "").strip()
+    if not description:
+        raise HTTPException(status_code=422, detail="product_description is required.")
+    if not import_country:
+        raise HTTPException(status_code=422, detail="import_country is required.")
+    return {
+        "success": True,
+        **code_result,
+        "product_description_provided": True,
+        "import_country": import_country,
+        "country_of_origin": origin_country or None,
+        "classification_status": "NOT_VERIFIED",
+        "tariff_schedule_status": "NOT_QUERIED",
+        "human_customs_review_required": True,
+    }
+
+
 @router.get("")
 def list_trade_documents(
     authorization: str = Header(default=""),
