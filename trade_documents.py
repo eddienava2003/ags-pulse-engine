@@ -371,9 +371,24 @@ async def upload_trade_document(
     path = f"{org_id}/{document_id}/v{version}/{uuid.uuid4().hex}-{filename}"
     try:
         db.storage.from_(BUCKET).upload(path, data, {"content-type": mime, "upsert": "false"})
+        extracted_text = None
+        try:
+            if mime == "text/plain":
+                extracted_text = data.decode("utf-8", errors="replace")[:100000]
+            elif mime == "application/pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                extracted_text = "\\n".join(page.extract_text() or "" for page in reader.pages)[:100000]
+            elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                from docx import Document
+                parsed = Document(io.BytesIO(data))
+                extracted_text = "\\n".join(p.text for p in parsed.paragraphs)[:100000]
+        except Exception:
+            logger.exception("Text extraction failed for uploaded trade document.")
         updated = db.table("trade_documents").update({
             "storage_path": path,
             "mime_type": mime,
+            "extracted_text": extracted_text,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", document_id).eq("organization_id", org_id).execute().data
         if not updated:
