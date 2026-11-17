@@ -50,6 +50,19 @@ class TradeDocumentBackendTests(unittest.TestCase):
         self.assertFalse(trade_documents._valid_file_signature("application/pdf", b"not a pdf"))
         self.assertFalse(trade_documents._valid_file_signature("text/plain", b"hello" + bytes([0]) + b"world"))
 
+    def test_hs_code_format_check_distinguishes_format_from_classification(self):
+        valid = trade_documents._hs_code_format_check(" 1234.56 ")
+        self.assertTrue(valid["valid_format"])
+        self.assertEqual(valid["normalized_code"], "123456")
+        self.assertIn("not been verified", valid["message"].lower())
+        self.assertFalse(trade_documents._hs_code_format_check("12AB56")["valid_format"])
+        self.assertFalse(trade_documents._hs_code_format_check("12345")["valid_format"])
+
+    def test_customs_routes_are_registered(self):
+        paths = {route.path for route in trade_documents.router.routes}
+        self.assertIn("/trade-documents/customs/hs-code/validate", paths)
+        self.assertIn("/trade-documents/customs/orders/{order_id}/readiness", paths)
+
     def test_api_routes_are_registered(self):
         paths = {route.path for route in trade_documents.router.routes}
         self.assertIn("/trade-documents", paths)
