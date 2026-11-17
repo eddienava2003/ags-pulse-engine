@@ -243,6 +243,18 @@ def route_matches(
     return True
 
 
+def is_test_telemetry_row(row):
+    # Do not classify a legitimate street address such as "Test Dr" as test data.
+    # Use operational status, update text, carrier, and tracking/RFQ identifiers.
+    row_markers = " ".join([
+        clean(row.get("status")),
+        clean(row.get("status_update")),
+        clean(row.get("carrier")),
+        clean(row.get("rfq_id"))
+    ]).casefold()
+    return any(marker in row_markers for marker in ("test", "simulat", "automation", "e2e", "smoke"))
+
+
 def is_production_telemetry_row(shipment, row):
     if clean(row.get("shipment_id")) != clean(shipment.get("id")):
         return False
@@ -252,11 +264,7 @@ def is_production_telemetry_row(shipment, row):
         return False
     if not route_matches(row, shipment.get("origin"), shipment.get("destination")):
         return False
-    row_markers = " ".join([
-        clean(row.get("status")), clean(row.get("hub_location")),
-        clean(row.get("status_update"))
-    ]).casefold()
-    if any(marker in row_markers for marker in ("test", "automation", "e2e", "smoke")):
+    if is_test_telemetry_row(row):
         return False
     return True
 
@@ -2287,6 +2295,7 @@ def execute_genrai_autonomous_monitor():
         "shipments_checked": 0,
         "clear_shipments": 0,
         "unknown_shipments": 0,
+        "excluded_test_shipments": 0,
         "alerts_recommended": 0,
         "errors": [],
         "shipments": [],
@@ -2379,10 +2388,27 @@ def execute_genrai_autonomous_monitor():
             )
 
             if telemetry is None:
-                result["missing_information"].append(
-                    "No explicit or uniquely identifiable production telemetry record"
-                )
-                report["unknown_shipments"] += 1
+                production_id = shipment.get("production_telemetry_id")
+                linked_test_row = next((
+                    row for row in linked_rows
+                    if production_id is not None
+                    and clean(row.get("id")) == clean(production_id)
+                    and clean(row.get("shipment_id")) == clean(shipment_id)
+                    and is_test_telemetry_row(row)
+                ), None)
+
+                if linked_test_row is not None:
+                    result["monitoring_state"] = "EXCLUDED_TEST_DATA"
+                    result["missing_information"].append(
+                        "Linked telemetry is marked as test or simulated data"
+                    )
+                    report["excluded_test_shipments"] += 1
+                else:
+                    result["missing_information"].append(
+                        "No explicit or uniquely identifiable production telemetry record"
+                    )
+                    report["unknown_shipments"] += 1
+
                 report["shipments"].append(result)
                 continue
 
@@ -2503,7 +2529,7 @@ def execute_genrai_autonomous_monitor():
             "genrai-autonomous-monitor-cycle",
             "GENRAI autonomous monitoring cycle",
             "Latest scheduled safe-mode monitoring cycle and shipment exception counts.",
-            evidence={key: report[key] for key in ("shipments_checked", "clear_shipments", "unknown_shipments", "alerts_recommended", "monitoring_completed")},
+            evidence={key: report[key] for key in ("shipments_checked", "clear_shipments", "unknown_shipments", "excluded_test_shipments", "alerts_recommended", "monitoring_completed")},
             verification_result="Monitoring cycle completed successfully; source shipment records were not modified."
         )
 
