@@ -85,10 +85,6 @@ class TradeDocumentBackendTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 401)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
     def test_usitc_response_normalization(self):
         rows = trade_documents._usitc_search_records([
             {"htsno": "8541.43.00.10", "description": "Photovoltaic cells", "general": "Free", "special": "", "other": "35%"},
@@ -123,3 +119,7 @@ if __name__ == "__main__":
                     {"product_description":"coffee beans","import_country":"Canada"}
                 )
         self.assertEqual(raised.exception.status_code, 422)
+
+
+if __name__ == "__main__":
+    unittest.main()
