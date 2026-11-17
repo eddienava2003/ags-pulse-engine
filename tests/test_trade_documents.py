@@ -86,7 +86,42 @@ class TradeDocumentBackendTests(unittest.TestCase):
             trade_documents._auth_context("")
         self.assertEqual(raised.exception.status_code, 401)
 
+    def test_auth_context_rejects_requested_non_member_organization(self):
+        with patch.object(trade_documents, "_client", return_value=FakeDatabase()):
+            with self.assertRaises(trade_documents.HTTPException) as raised:
+                trade_documents._auth_context("Bearer test-token", "org-outside-membership")
+        self.assertEqual(raised.exception.status_code, 403)
 
+    def test_document_lookup_is_scoped_to_document_and_organization(self):
+        class ScopedQuery:
+            def __init__(self):
+                self.filters = []
+
+            def select(self, *_args, **_kwargs):
+                return self
+
+            def eq(self, key, value):
+                self.filters.append((key, value))
+                return self
+
+            def limit(self, *_args, **_kwargs):
+                return self
+
+            def execute(self):
+                return SimpleNamespace(data=[])
+
+        query = ScopedQuery()
+
+        class ScopedDatabase:
+            def table(self, _name):
+                return query
+
+        with self.assertRaises(trade_documents.HTTPException) as raised:
+            trade_documents._document(ScopedDatabase(), "doc-1", "org-123")
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertIn(("id", "doc-1"), query.filters)
+        self.assertIn(("organization_id", "org-123"), query.filters)
 
     def test_document_review_state_machine_helpers_are_registered(self):
         paths = {route.path for route in trade_documents.router.routes}
@@ -99,22 +134,29 @@ class TradeDocumentBackendTests(unittest.TestCase):
             def __init__(self, returns):
                 self.returns = returns
                 self.filters = []
+
             def select(self, *_args, **_kwargs):
                 return self
+
             def update(self, *_args, **_kwargs):
                 return self
+
             def eq(self, key, value):
                 self.filters.append((key, value))
                 return self
+
             def order(self, *_args, **_kwargs):
                 return self
+
             def limit(self, *_args, **_kwargs):
                 return self
+
             def execute(self):
                 return SimpleNamespace(data=self.returns)
 
         review_query = DecisionQuery([{"overall_risk": "LOW", "review_status": "COMPLETED"}])
         update_query = DecisionQuery([])
+
         class DecisionDatabase:
             def table(self, name):
                 return review_query if name == "trade_document_reviews" else update_query
@@ -126,6 +168,7 @@ class TradeDocumentBackendTests(unittest.TestCase):
                 trade_documents.decide_trade_document(
                     "doc-1", {"decision": "APPROVED"}, "Bearer token", "org-123"
                 )
+
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn(("status", "PENDING_REVIEW"), update_query.filters)
 
