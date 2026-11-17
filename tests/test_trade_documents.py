@@ -88,6 +88,12 @@ class TradeDocumentBackendTests(unittest.TestCase):
 
 
 
+    def test_document_review_state_machine_helpers_are_registered(self):
+        paths = {route.path for route in trade_documents.router.routes}
+        self.assertIn("/trade-documents/{document_id}/decision", paths)
+        self.assertIn("/trade-documents/{document_id}/upload", paths)
+        self.assertIn("/trade-documents/{document_id}/render", paths)
+
     def test_customs_packet_requires_certificate_for_cross_border_orders(self):
         required = trade_documents._required_customs_document_types({
             "buyer_country": "United States",
