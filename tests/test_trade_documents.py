@@ -62,6 +62,7 @@ class TradeDocumentBackendTests(unittest.TestCase):
         paths = {route.path for route in trade_documents.router.routes}
         self.assertIn("/trade-documents/customs/hs-code/validate", paths)
         self.assertIn("/trade-documents/customs/orders/{order_id}/readiness", paths)
+        self.assertIn("/trade-documents/customs/orders/{order_id}/prepare", paths)
 
     def test_api_routes_are_registered(self):
         paths = {route.path for route in trade_documents.router.routes}
@@ -84,6 +85,21 @@ class TradeDocumentBackendTests(unittest.TestCase):
             trade_documents._auth_context("")
         self.assertEqual(raised.exception.status_code, 401)
 
+
+
+    def test_customs_packet_requires_certificate_for_cross_border_orders(self):
+        required = trade_documents._required_customs_document_types({
+            "buyer_country": "United States",
+            "seller_country": "Mexico",
+        })
+        self.assertEqual(required, ["COMMERCIAL_INVOICE", "PACKING_LIST", "CERTIFICATE_OF_ORIGIN"])
+
+    def test_customs_packet_omits_certificate_for_same_country_order(self):
+        required = trade_documents._required_customs_document_types({
+            "buyer_country": "United States",
+            "seller_country": "united states",
+        })
+        self.assertEqual(required, ["COMMERCIAL_INVOICE", "PACKING_LIST"])
 
     def test_usitc_response_normalization(self):
         rows = trade_documents._usitc_search_records([
