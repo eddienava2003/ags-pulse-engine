@@ -39,6 +39,17 @@ class TradeDocumentBackendTests(unittest.TestCase):
         for doc_type in ("COMMERCIAL_INVOICE", "PACKING_LIST", "BOL_DRAFT", "CERTIFICATE_OF_ORIGIN"):
             self.assertIn(doc_type, trade_documents.DOCUMENT_TYPES)
 
+    def test_file_signature_validation_accepts_real_pdf_and_docx_headers(self):
+        self.assertTrue(trade_documents._valid_file_signature("application/pdf", b"%PDF-1.7"))
+        self.assertTrue(trade_documents._valid_file_signature(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            b"PK\\x03\\x04payload",
+        ))
+
+    def test_file_signature_validation_rejects_mismatches_and_binary_text(self):
+        self.assertFalse(trade_documents._valid_file_signature("application/pdf", b"not a pdf"))
+        self.assertFalse(trade_documents._valid_file_signature("text/plain", b"hello\\x00world"))
+
     def test_api_routes_are_registered(self):
         paths = {route.path for route in trade_documents.router.routes}
         self.assertIn("/trade-documents", paths)
