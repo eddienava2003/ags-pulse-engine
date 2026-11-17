@@ -245,10 +245,11 @@ def prepare_customs_document_packet(
         db.table("trade_documents").select("id,document_type,title,status,version")
          .eq("order_id", order_id).eq("organization_id", org_id).order("created_at", desc=True).execute()
     ).data or []
-    active_by_type = {
-        row.get("document_type"): row for row in existing
-        if row.get("status") in {"DRAFT", "PENDING_REVIEW", "APPROVED"}
-    }
+    active_by_type = {}
+    for row in existing:
+        doc_type = row.get("document_type")
+        if doc_type and row.get("status") in {"DRAFT", "PENDING_REVIEW", "APPROVED"}:
+            active_by_type.setdefault(doc_type, row)
     packet = []
     created = []
     for doc_type in _required_customs_document_types(order):
@@ -463,7 +464,7 @@ def draft_trade_document(
             "title": str(generated.get("title") or title)[:200],
             "status": "DRAFT",
             "extracted_text": body,
-            "structured_data": {**(target_document.get("structured_data") or {}), **structured} if target_document else structured,
+            "structured_data": {**structured, **(target_document.get("structured_data") or {})} if target_document else structured,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         if target_document:
