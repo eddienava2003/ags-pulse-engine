@@ -43,12 +43,12 @@ class TradeDocumentBackendTests(unittest.TestCase):
         self.assertTrue(trade_documents._valid_file_signature("application/pdf", b"%PDF-1.7"))
         self.assertTrue(trade_documents._valid_file_signature(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            b"PK\\x03\\x04payload",
+            bytes.fromhex("504B0304") + b"payload",
         ))
 
     def test_file_signature_validation_rejects_mismatches_and_binary_text(self):
         self.assertFalse(trade_documents._valid_file_signature("application/pdf", b"not a pdf"))
-        self.assertFalse(trade_documents._valid_file_signature("text/plain", b"hello\\x00world"))
+        self.assertFalse(trade_documents._valid_file_signature("text/plain", b"hello" + bytes([0]) + b"world"))
 
     def test_api_routes_are_registered(self):
         paths = {route.path for route in trade_documents.router.routes}
