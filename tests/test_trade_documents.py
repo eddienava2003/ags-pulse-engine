@@ -44,6 +44,7 @@ class TradeDocumentBackendTests(unittest.TestCase):
         self.assertIn("/trade-documents", paths)
         self.assertIn("/trade-documents/draft", paths)
         self.assertIn("/trade-documents/{document_id}/review", paths)
+        self.assertIn("/trade-documents/{document_id}/decision", paths)
         self.assertIn("/trade-documents/{document_id}/render", paths)
         self.assertIn("/trade-documents/{document_id}/upload", paths)
         self.assertIn("/trade-documents/{document_id}/download", paths)
