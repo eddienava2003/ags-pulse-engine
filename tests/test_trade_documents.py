@@ -61,6 +61,7 @@ class TradeDocumentBackendTests(unittest.TestCase):
     def test_customs_routes_are_registered(self):
         paths = {route.path for route in trade_documents.router.routes}
         self.assertIn("/trade-documents/customs/hs-code/validate", paths)
+        self.assertIn("/trade-documents/customs/hs-code/lookup", paths)
         self.assertIn("/trade-documents/customs/orders/{order_id}/readiness", paths)
         self.assertIn("/trade-documents/customs/orders/{order_id}/prepare", paths)
 
