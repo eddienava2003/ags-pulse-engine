@@ -188,11 +188,8 @@ def get_customs_document_readiness(
         })
 
     approved_types = {row.get("document_type") for row in documents if row.get("status") == "APPROVED"}
-    required_documents = ["COMMERCIAL_INVOICE", "PACKING_LIST"]
+    required_documents = _required_customs_document_types(order)
     missing_documents = [doc_type for doc_type in required_documents if doc_type not in approved_types]
-    if str(order.get("buyer_country") or "").casefold() != str(order.get("seller_country") or "").casefold():
-        if "CERTIFICATE_OF_ORIGIN" not in approved_types:
-            missing_documents.append("CERTIFICATE_OF_ORIGIN")
 
     blockers = []
     if missing_order_fields:
@@ -246,7 +243,7 @@ def prepare_customs_document_packet(
     ).data or []
     existing = (
         db.table("trade_documents").select("id,document_type,title,status,version")
-        .eq("order_id", order_id).eq("organization_id", org_id).execute()
+         .eq("order_id", order_id).eq("organization_id", org_id).order("created_at", desc=True).execute()
     ).data or []
     active_by_type = {
         row.get("document_type"): row for row in existing
@@ -483,8 +480,6 @@ def draft_trade_document(
             }).execute().data
         if not row:
             raise RuntimeError("Document draft persistence returned no row.")
-        if not row:
-            raise RuntimeError("Document insert returned no row.")
         return {"success": True, "document": row[0], "review_required": True}
     except Exception:
         logger.exception("Trade document draft persistence failed.")
