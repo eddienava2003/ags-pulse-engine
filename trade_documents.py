@@ -217,6 +217,83 @@ def get_customs_document_readiness(
     }
 
 
+def _required_customs_document_types(order: dict):
+    required = ["COMMERCIAL_INVOICE", "PACKING_LIST"]
+    buyer = str(order.get("buyer_country") or "").strip().casefold()
+    seller = str(order.get("seller_country") or "").strip().casefold()
+    if buyer and seller and buyer != seller:
+        required.append("CERTIFICATE_OF_ORIGIN")
+    return required
+
+
+@router.post("/customs/orders/{order_id}/prepare", status_code=201)
+def prepare_customs_document_packet(
+    order_id: str,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+):
+    db, user_id, org_id = _auth_context(authorization, x_organization_id)
+    orders = (
+        db.table("trade_orders").select("*").eq("id", order_id)
+        .eq("organization_id", org_id).limit(1).execute()
+    ).data or []
+    if not orders:
+        raise HTTPException(status_code=404, detail="Trade order not found.")
+    order = orders[0]
+    items = (
+        db.table("trade_order_items").select("*").eq("order_id", order_id)
+        .eq("organization_id", org_id).execute()
+    ).data or []
+    existing = (
+        db.table("trade_documents").select("id,document_type,title,status,version")
+        .eq("order_id", order_id).eq("organization_id", org_id).execute()
+    ).data or []
+    active_by_type = {
+        row.get("document_type"): row for row in existing
+        if row.get("status") in {"DRAFT", "PENDING_REVIEW", "APPROVED"}
+    }
+    packet = []
+    created = []
+    for doc_type in _required_customs_document_types(order):
+        if doc_type in active_by_type:
+            packet.append(active_by_type[doc_type])
+            continue
+        title = doc_type.replace("_", " ").title()
+        seed = {
+            "workflow": "customs_document_packet",
+            "source_order_snapshot": order,
+            "source_line_items_snapshot": items,
+            "human_review_required": True,
+            "ai_draft_required": True,
+        }
+        try:
+            rows = db.table("trade_documents").insert({
+                "organization_id": org_id,
+                "order_id": order_id,
+                "document_type": doc_type,
+                "title": title,
+                "status": "DRAFT",
+                "structured_data": seed,
+                "created_by": user_id,
+            }).execute().data or []
+            if not rows:
+                raise RuntimeError("Document insert returned no row.")
+            packet.append(rows[0])
+            created.append(rows[0])
+        except Exception:
+            logger.exception("Customs document packet creation failed for order %s type %s", order_id, doc_type)
+            raise HTTPException(status_code=503, detail="Customs document packet could not be created completely.")
+    return {
+        "success": True,
+        "order_id": order_id,
+        "required_document_types": _required_customs_document_types(order),
+        "created_count": len(created),
+        "documents": packet,
+        "next_step": "Draft each DRAFT document using POST /trade-documents/draft with its document_id, then review and obtain human approval.",
+        "important_notice": "Packet preparation creates draft records and copies order data as a starting snapshot. It does not create filing-ready documents or certify customs compliance.",
+    }
+
+
 @router.post("/customs/hs-code/validate")
 def validate_customs_hs_code(
     payload: dict,
@@ -341,6 +418,17 @@ def draft_trade_document(
     title = str(payload.get("title") or doc_type.replace("_", " ").title()).strip()[:200]
     instructions = str(payload.get("instructions") or "").strip()[:6000]
     order_id = str(payload.get("order_id") or "").strip() or None
+    target_document_id = str(payload.get("document_id") or "").strip() or None
+    target_document = _document(db, target_document_id, org_id) if target_document_id else None
+    if target_document:
+        if target_document.get("document_type") != doc_type:
+            raise HTTPException(status_code=409, detail="document_id document_type does not match the requested draft type.")
+        if target_document.get("status") not in {"DRAFT", "REJECTED"}:
+            raise HTTPException(status_code=409, detail="Only DRAFT or REJECTED documents can be re-drafted.")
+        existing_order_id = str(target_document.get("order_id") or "").strip() or None
+        if order_id and order_id != existing_order_id:
+            raise HTTPException(status_code=409, detail="document_id is not linked to the requested trade order.")
+        order_id = existing_order_id
     order = None
     items = []
     if order_id:
@@ -374,16 +462,27 @@ def draft_trade_document(
         "ai_generated": True,
     })
     try:
-        row = db.table("trade_documents").insert({
-            "organization_id": org_id,
-            "order_id": order_id,
-            "document_type": doc_type,
+        draft_values = {
             "title": str(generated.get("title") or title)[:200],
             "status": "DRAFT",
             "extracted_text": body,
-            "structured_data": structured,
-            "created_by": user_id,
-        }).execute().data
+            "structured_data": {**(target_document.get("structured_data") or {}), **structured} if target_document else structured,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if target_document:
+            row = db.table("trade_documents").update(draft_values).eq(
+                "id", target_document_id
+            ).eq("organization_id", org_id).execute().data
+        else:
+            row = db.table("trade_documents").insert({
+                "organization_id": org_id,
+                "order_id": order_id,
+                "document_type": doc_type,
+                **draft_values,
+                "created_by": user_id,
+            }).execute().data
+        if not row:
+            raise RuntimeError("Document draft persistence returned no row.")
         if not row:
             raise RuntimeError("Document insert returned no row.")
         return {"success": True, "document": row[0], "review_required": True}
