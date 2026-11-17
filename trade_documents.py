@@ -766,3 +766,5 @@ def lookup_us_customs_hs_code(
         "human_customs_review_required": True,
         "important_notice": "USITC search results are candidate schedule entries, not a legally binding classification or complete duty calculation. Search results may omit related provisions, Chapter 99 measures, trade remedies, origin rules, and current CBP rulings. Confirm the current HTSUS and obtain qualified customs review before filing.",
     }
+
+# USITC lookup implementation is intentionally limited to the U.S. HTSUS.
