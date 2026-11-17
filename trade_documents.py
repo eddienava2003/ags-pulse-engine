@@ -421,6 +421,18 @@ async def upload_trade_document(
     data = bytes(chunks)
     if not data:
         raise HTTPException(status_code=400, detail="An upload body is required.")
+    signatures = {
+        "application/pdf": data.startswith(b"%PDF-"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": data.startswith(b"PK\\x03\\x04"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": data.startswith(b"PK\\x03\\x04"),
+        "application/msword": data.startswith(bytes.fromhex("D0CF11E0A1B11AE1")),
+        "application/vnd.ms-excel": data.startswith(bytes.fromhex("D0CF11E0A1B11AE1")),
+        "image/png": data.startswith(bytes.fromhex("89504E470D0A1A0A")),
+        "image/jpeg": data.startswith(bytes.fromhex("FFD8FF")),
+        "text/plain": b"\\x00" not in data,
+    }
+    if not signatures.get(mime, False):
+        raise HTTPException(status_code=415, detail="File signature does not match the declared content type.")
     raw_name = request.headers.get("x-file-name", "uploaded-document")
     filename = PurePosixPath(raw_name.replace("\\", "/")).name
     filename = _safe_filename(filename.rsplit(".", 1)[0], filename.rsplit(".", 1)[-1] if "." in filename else "bin")
