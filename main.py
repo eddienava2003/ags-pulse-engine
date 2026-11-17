@@ -1859,6 +1859,93 @@ async def create_organization_shipment(
 
 
 # --------------------------------------------------
+# AUTHENTICATED ORGANIZATION-SCOPED TRACKING UPDATE
+# --------------------------------------------------
+
+@app.post("/shipments/{shipment_id}/tracking-update")
+async def update_organization_shipment_tracking(
+    shipment_id: int,
+    request: Request,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default="")
+):
+    """Atomically update a tenant shipment, emit telemetry, and append its checkpoint."""
+    organization_id = resolve_dashboard_organization(authorization, x_organization_id)
+
+    scheme, separator, token = clean(authorization).partition(" ")
+    if not separator or scheme.casefold() != "bearer":
+        raise HTTPException(status_code=401, detail="A valid Bearer access token is required.")
+    try:
+        auth_response = supabase.auth.get_user(token.strip())
+        user_id = clean(getattr(getattr(auth_response, "user", None), "id", ""))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required.")
+
+    status = clean(payload.get("status"))[:100]
+    location = clean(payload.get("location"))[:250]
+    status_update = clean(payload.get("status_update"))[:2000] or "Manual tracking update recorded in AGS-Pulse."
+    message = clean(payload.get("message"))[:2000] or None
+    raw_checkpoint_time = clean(payload.get("checkpoint_time"))
+
+    if not status or not location:
+        raise HTTPException(status_code=422, detail="status and location are required.")
+
+    checkpoint_time = now_utc()
+    if raw_checkpoint_time:
+        try:
+            parsed_time = datetime.fromisoformat(raw_checkpoint_time.replace("Z", "+00:00"))
+            if parsed_time.tzinfo is None:
+                parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+            checkpoint_time = parsed_time.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="checkpoint_time must be a valid ISO 8601 timestamp.")
+
+    try:
+        result = supabase.rpc(
+            "record_org_shipment_tracking_update",
+            {
+                "p_organization_id": organization_id,
+                "p_shipment_id": shipment_id,
+                "p_user_id": user_id,
+                "p_status": status,
+                "p_location": location,
+                "p_status_update": status_update,
+                "p_checkpoint_time": checkpoint_time,
+                "p_message": message
+            }
+        ).execute()
+        if not result.data:
+            raise RuntimeError("Tracking update returned no confirmation.")
+        return {
+            "success": True,
+            "scope": "organization",
+            "organization_id": organization_id,
+            "tracking_update": result.data
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        error_text = str(exc).casefold()
+        logger.exception("Organization shipment tracking update failed.")
+        if "shipment not found in selected organization" in error_text:
+            raise HTTPException(status_code=404, detail="Shipment not found in the selected organization.")
+        if "cannot update shipments in this organization" in error_text:
+            raise HTTPException(status_code=403, detail="Your organization role cannot update shipments.")
+        if "status and location are required" in error_text:
+            raise HTTPException(status_code=422, detail="status and location are required.")
+        raise HTTPException(status_code=503, detail="Tracking update could not be saved.")
+
+ 
+# --------------------------------------------------
 # PROTECTED DATABASE TEST ENDPOINT
 # --------------------------------------------------
 
