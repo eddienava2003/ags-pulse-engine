@@ -433,7 +433,7 @@ async def upload_trade_document(
     }
     if not signatures.get(mime, False):
         raise HTTPException(status_code=415, detail="File signature does not match the declared content type.")
-    raw_name = request.headers.get("x-file-name", "uploaded-document")
+    raw_name = request.query_params.get("filename", "uploaded-document")
     filename = PurePosixPath(raw_name.replace("\\", "/")).name
     filename = _safe_filename(filename.rsplit(".", 1)[0], filename.rsplit(".", 1)[-1] if "." in filename else "bin")
     version = int(document.get("version") or 1)
