@@ -581,6 +581,8 @@ def decide_trade_document(
                 detail="The document review state changed. Reload the document before deciding.",
             )
         return {"success": True, "document": rows[0], "review_risk": risk}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Trade document human decision failed.")
         raise HTTPException(status_code=503, detail="Document decision could not be saved.")
