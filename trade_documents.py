@@ -120,13 +120,13 @@ def _safe_filename(value: str, extension: str):
 def _valid_file_signature(mime: str, data: bytes) -> bool:
     signatures = {
         "application/pdf": data.startswith(b"%PDF-"),
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": data.startswith(b"PK\\x03\\x04"),
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": data.startswith(b"PK\\x03\\x04"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": data.startswith(bytes.fromhex("504B0304")),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": data.startswith(bytes.fromhex("504B0304")),
         "application/msword": data.startswith(bytes.fromhex("D0CF11E0A1B11AE1")),
         "application/vnd.ms-excel": data.startswith(bytes.fromhex("D0CF11E0A1B11AE1")),
         "image/png": data.startswith(bytes.fromhex("89504E470D0A1A0A")),
         "image/jpeg": data.startswith(bytes.fromhex("FFD8FF")),
-        "text/plain": b"\\x00" not in data,
+        "text/plain": bytes([0]) not in data,
     }
     return signatures.get(mime, False)
 
