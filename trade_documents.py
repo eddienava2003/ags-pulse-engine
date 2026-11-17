@@ -378,11 +378,11 @@ async def upload_trade_document(
             elif mime == "application/pdf":
                 from pypdf import PdfReader
                 reader = PdfReader(io.BytesIO(data))
-                extracted_text = "\\n".join(page.extract_text() or "" for page in reader.pages)[:100000]
+                extracted_text = "\n".join(page.extract_text() or "" for page in reader.pages)[:100000]
             elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
                 from docx import Document
                 parsed = Document(io.BytesIO(data))
-                extracted_text = "\\n".join(p.text for p in parsed.paragraphs)[:100000]
+                extracted_text = "\n".join(p.text for p in parsed.paragraphs)[:100000]
         except Exception:
             logger.exception("Text extraction failed for uploaded trade document.")
         updated = db.table("trade_documents").update({
