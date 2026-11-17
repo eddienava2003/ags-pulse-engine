@@ -94,6 +94,41 @@ class TradeDocumentBackendTests(unittest.TestCase):
         self.assertIn("/trade-documents/{document_id}/upload", paths)
         self.assertIn("/trade-documents/{document_id}/render", paths)
 
+    def test_human_decision_uses_compare_and_set_on_pending_review(self):
+        class DecisionQuery:
+            def __init__(self, returns):
+                self.returns = returns
+                self.filters = []
+            def select(self, *_args, **_kwargs):
+                return self
+            def update(self, *_args, **_kwargs):
+                return self
+            def eq(self, key, value):
+                self.filters.append((key, value))
+                return self
+            def order(self, *_args, **_kwargs):
+                return self
+            def limit(self, *_args, **_kwargs):
+                return self
+            def execute(self):
+                return SimpleNamespace(data=self.returns)
+
+        review_query = DecisionQuery([{"overall_risk": "LOW", "review_status": "COMPLETED"}])
+        update_query = DecisionQuery([])
+        class DecisionDatabase:
+            def table(self, name):
+                return review_query if name == "trade_document_reviews" else update_query
+
+        with patch.object(trade_documents, "_auth_context", return_value=(DecisionDatabase(), "user-123", "org-123")), patch.object(
+            trade_documents, "_document", return_value={"id": "doc-1", "status": "PENDING_REVIEW"}
+        ):
+            with self.assertRaises(trade_documents.HTTPException) as raised:
+                trade_documents.decide_trade_document(
+                    "doc-1", {"decision": "APPROVED"}, "Bearer token", "org-123"
+                )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn(("status", "PENDING_REVIEW"), update_query.filters)
+
     def test_customs_packet_requires_certificate_for_cross_border_orders(self):
         required = trade_documents._required_customs_document_types({
             "buyer_country": "United States",
