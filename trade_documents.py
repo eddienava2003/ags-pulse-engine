@@ -495,6 +495,8 @@ def review_trade_document(
 ):
     db, _, org_id = _auth_context(authorization, x_organization_id)
     document = _document(db, document_id, org_id)
+    if document.get("status") == "APPROVED":
+        raise HTTPException(status_code=409, detail="Approved documents must be amended and returned to DRAFT before another review.")
     content = str(document.get("extracted_text") or "")
     if not content.strip():
         raise HTTPException(status_code=422, detail="Document has no text to review.")
@@ -546,6 +548,8 @@ def decide_trade_document(
 ):
     db, user_id, org_id = _auth_context(authorization, x_organization_id)
     document = _document(db, document_id, org_id)
+    if document.get("status") != "PENDING_REVIEW":
+        raise HTTPException(status_code=409, detail="A human decision is allowed only while the document is PENDING_REVIEW.")
     decision = str((payload or {}).get("decision") or "").strip().upper()
     if decision not in {"APPROVED", "REJECTED"}:
         raise HTTPException(status_code=422, detail="decision must be APPROVED or REJECTED.")
@@ -646,6 +650,9 @@ def render_trade_document(
             "storage_path": path,
             "mime_type": mime,
             "extracted_text": extracted_text,
+            "status": "DRAFT",
+            "approved_by": None,
+            "approved_at": None,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", document_id).eq("organization_id", org_id).execute().data
         if not updated:
@@ -712,6 +719,9 @@ async def upload_trade_document(
             "storage_path": path,
             "mime_type": mime,
             "extracted_text": extracted_text,
+            "status": "DRAFT",
+            "approved_by": None,
+            "approved_at": None,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", document_id).eq("organization_id", org_id).execute().data
         if not updated:
