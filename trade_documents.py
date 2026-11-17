@@ -572,9 +572,14 @@ def decide_trade_document(
     try:
         rows = db.table("trade_documents").update(update).eq(
             "id", document_id
-        ).eq("organization_id", org_id).execute().data
+        ).eq("organization_id", org_id).eq(
+            "status", "PENDING_REVIEW"
+        ).execute().data
         if not rows:
-            raise RuntimeError("Document decision update returned no row.")
+            raise HTTPException(
+                status_code=409,
+                detail="The document review state changed. Reload the document before deciding.",
+            )
         return {"success": True, "document": rows[0], "review_risk": risk}
     except Exception:
         logger.exception("Trade document human decision failed.")
