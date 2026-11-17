@@ -34,6 +34,9 @@ app = FastAPI(
 from genrai_progress import router as genrai_progress_router
 app.include_router(genrai_progress_router)
 
+from trade_documents import router as trade_documents_router
+app.include_router(trade_documents_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
