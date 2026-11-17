@@ -113,7 +113,8 @@ def _ai_json(system_prompt: str, user_payload: dict):
 
 def _safe_filename(value: str, extension: str):
     base = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "document").strip("-._")[:90] or "document"
-    return f"{base}.{extension}"
+    suffix = re.sub(r"[^A-Za-z0-9]+", "", extension or "bin").lower()[:8] or "bin"
+    return f"{base}.{suffix}"
 
 
 @router.get("")
@@ -305,9 +306,25 @@ def render_trade_document(
         filename = _safe_filename(str(document.get("title") or "trade-document"), extension)
         path = f"{org_id}/{document_id}/v{version}/{uuid.uuid4().hex}-{filename}"
         db.storage.from_(BUCKET).upload(path, data, {"content-type": mime, "upsert": "true"})
+        extracted_text = None
+        try:
+            if mime == "text/plain":
+                extracted_text = data.decode("utf-8", errors="replace")[:100000]
+            elif mime == "application/pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                extracted_text = "\n".join(page.extract_text() or "" for page in reader.pages)[:100000]
+            elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                from docx import Document
+                parsed = Document(io.BytesIO(data))
+                extracted_text = "\n".join(p.text for p in parsed.paragraphs)[:100000]
+        except Exception:
+            logger.exception("Text extraction failed for uploaded trade document.")
+            extracted_text = None
         updated = db.table("trade_documents").update({
             "storage_path": path,
             "mime_type": mime,
+            "extracted_text": extracted_text,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", document_id).eq("organization_id", org_id).execute().data
         if not updated:
@@ -332,9 +349,21 @@ async def upload_trade_document(
     mime = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
     if mime not in ALLOWED_MIME_TYPES:
         raise HTTPException(status_code=415, detail="Unsupported document content type.")
-    data = await request.body()
-    if not data or len(data) > MAX_FILE_BYTES:
-        raise HTTPException(status_code=413, detail="Upload must be between 1 byte and 25 MB.")
+    declared_size = request.headers.get("content-length")
+    if declared_size:
+        try:
+            if int(declared_size) > MAX_FILE_BYTES:
+                raise HTTPException(status_code=413, detail="Upload exceeds the 25 MB limit.")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+    chunks = bytearray()
+    async for chunk in request.stream():
+        chunks.extend(chunk)
+        if len(chunks) > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail="Upload exceeds the 25 MB limit.")
+    data = bytes(chunks)
+    if not data:
+        raise HTTPException(status_code=400, detail="An upload body is required.")
     raw_name = request.headers.get("x-file-name", "uploaded-document")
     filename = PurePosixPath(raw_name.replace("\\", "/")).name
     filename = _safe_filename(filename.rsplit(".", 1)[0], filename.rsplit(".", 1)[-1] if "." in filename else "bin")
