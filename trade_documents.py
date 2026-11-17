@@ -313,6 +313,46 @@ def review_trade_document(
         raise HTTPException(status_code=503, detail="Document review could not be saved.")
 
 
+@router.post("/{document_id}/decision")
+def decide_trade_document(
+    document_id: str,
+    payload: dict,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+):
+    db, user_id, org_id = _auth_context(authorization, x_organization_id)
+    document = _document(db, document_id, org_id)
+    decision = str((payload or {}).get("decision") or "").strip().upper()
+    if decision not in {"APPROVED", "REJECTED"}:
+        raise HTTPException(status_code=422, detail="decision must be APPROVED or REJECTED.")
+    reviews = (
+        db.table("trade_document_reviews").select("overall_risk,review_status")
+        .eq("document_id", document_id).eq("organization_id", org_id)
+        .order("created_at", desc=True).limit(1).execute()
+    ).data or []
+    if not reviews or reviews[0].get("review_status") != "COMPLETED":
+        raise HTTPException(status_code=409, detail="A completed AI review is required before a human decision.")
+    risk = str(reviews[0].get("overall_risk") or "UNASSESSED").upper()
+    if decision == "APPROVED" and risk in {"HIGH", "CRITICAL"} and (payload or {}).get("acknowledge_high_risk") is not True:
+        raise HTTPException(status_code=409, detail="Explicit high-risk acknowledgement is required before approval.")
+    update = {
+        "status": decision,
+        "approved_by": user_id if decision == "APPROVED" else None,
+        "approved_at": datetime.now(timezone.utc).isoformat() if decision == "APPROVED" else None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        rows = db.table("trade_documents").update(update).eq(
+            "id", document_id
+        ).eq("organization_id", org_id).execute().data
+        if not rows:
+            raise RuntimeError("Document decision update returned no row.")
+        return {"success": True, "document": rows[0], "review_risk": risk}
+    except Exception:
+        logger.exception("Trade document human decision failed.")
+        raise HTTPException(status_code=503, detail="Document decision could not be saved.")
+
+
 @router.post("/{document_id}/render")
 def render_trade_document(
     document_id: str,
