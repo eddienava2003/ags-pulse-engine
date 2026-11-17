@@ -180,7 +180,7 @@ def get_customs_document_readiness(
         ]
         hs_check = _hs_code_format_check(item.get("hs_code") or "")
         item_checks.append({
-            "item_id": item.get("id),
+            "item_id": item.get("id"),
             "description": item.get("description"),
             "missing_fields": missing,
             "hs_code_format": hs_check,
