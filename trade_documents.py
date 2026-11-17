@@ -140,6 +140,63 @@ def list_trade_documents(
         raise HTTPException(status_code=503, detail="Documents could not be loaded.")
 
 
+@router.post("", status_code=201)
+def create_trade_document(
+    payload: dict,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+):
+    db, user_id, org_id = _auth_context(authorization, x_organization_id)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="A JSON object is required.")
+    doc_type = str(payload.get("document_type") or "OTHER").strip().upper()
+    if doc_type not in DOCUMENT_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported document_type.")
+    title = str(payload.get("title") or "").strip()[:200]
+    if not title:
+        raise HTTPException(status_code=422, detail="title is required.")
+    order_id = str(payload.get("order_id") or "").strip() or None
+    if order_id:
+        parent = (
+            db.table("trade_orders").select("id").eq("id", order_id)
+            .eq("organization_id", org_id).limit(1).execute()
+        ).data or []
+        if not parent:
+            raise HTTPException(status_code=404, detail="Trade order not found in this organization.")
+    try:
+        row = db.table("trade_documents").insert({
+            "organization_id": org_id,
+            "order_id": order_id,
+            "document_type": doc_type,
+            "title": title,
+            "status": "DRAFT",
+            "structured_data": payload.get("structured_data") if isinstance(payload.get("structured_data"), dict) else {},
+            "created_by": user_id,
+        }).execute().data
+        if not row:
+            raise RuntimeError("Document insert returned no row.")
+        return {"success": True, "document": row[0]}
+    except Exception:
+        logger.exception("Trade document record creation failed.")
+        raise HTTPException(status_code=503, detail="Document record could not be created.")
+
+
+@router.get("/{document_id}")
+def get_trade_document(
+    document_id: str,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+):
+    db, _, org_id = _auth_context(authorization, x_organization_id)
+    document = _document(db, document_id, org_id)
+    reviews = (
+        db.table("trade_document_reviews").select("*")
+        .eq("document_id", document_id).eq("organization_id", org_id)
+        .order("created_at", desc=True).limit(10).execute()
+    ).data or []
+    return {"success": True, "document": document, "reviews": reviews}
+
+
 @router.post("/draft", status_code=201)
 def draft_trade_document(
     payload: dict,
