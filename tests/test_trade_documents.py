@@ -87,3 +87,39 @@ class TradeDocumentBackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    def test_usitc_response_normalization(self):
+        rows = trade_documents._usitc_search_records([
+            {"htsno": "8541.43.00.10", "description": "Photovoltaic cells", "general": "Free", "special": "", "other": "35%"},
+            {"unexpected": "shape"},
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["hts_number"], "8541.43.00.10")
+        self.assertEqual(rows[0]["general_rate"], "Free")
+
+    def test_usitc_lookup_returns_candidates_not_classification(self):
+        fake_response = SimpleNamespace(
+            headers={"content-type": "application/json"},
+            text='[{"htsno":"8541.43.00.10","description":"Photovoltaic cells","general":"Free"}]',
+            json=lambda: [{"htsno":"8541.43.00.10","description":"Photovoltaic cells","general":"Free"}],
+            raise_for_status=lambda: None,
+        )
+        with patch.object(trade_documents, "_auth_context", return_value=(FakeDatabase(), "user-123", "org-123")), patch(
+            "httpx.get", return_value=fake_response
+        ) as request:
+            result = trade_documents.lookup_us_customs_hs_code(
+                {"hs_code":"8541430010","import_country":"United States"}
+            )
+        self.assertEqual(result["result_count"], 1)
+        self.assertEqual(result["classification_status"], "CANDIDATES_RETRIEVED_NOT_CLASSIFIED")
+        self.assertTrue(result["human_customs_review_required"])
+        self.assertEqual(request.call_args.kwargs["params"]["keyword"], "8541430010")
+
+    def test_usitc_lookup_rejects_non_us_market(self):
+        with patch.object(trade_documents, "_auth_context", return_value=(FakeDatabase(), "user-123", "org-123")):
+            with self.assertRaises(trade_documents.HTTPException) as raised:
+                trade_documents.lookup_us_customs_hs_code(
+                    {"product_description":"coffee beans","import_country":"Canada"}
+                )
+        self.assertEqual(raised.exception.status_code, 422)
