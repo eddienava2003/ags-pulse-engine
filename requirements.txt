@@ -4,3 +4,5 @@ httpx
 pydantic
 supabase
 openai
+reportlab
+python-docx
