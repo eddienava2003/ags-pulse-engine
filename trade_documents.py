@@ -647,3 +647,122 @@ def get_trade_document_download(
     except Exception:
         logger.exception("Trade document signed URL creation failed.")
         raise HTTPException(status_code=503, detail="Secure document download is unavailable.")
+
+
+def _usitc_search_records(payload):
+    """Normalize the documented USITC search response without assuming one wrapper shape."""
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = None
+        for key in ("results", "data", "items", "HTSDetails", "htsDetails"):
+            if isinstance(payload.get(key), list):
+                records = payload[key]
+                break
+        if records is None:
+            records = [payload] if payload.get("htsno") else []
+    else:
+        records = []
+    normalized = []
+    for item in records[:100]:
+        if not isinstance(item, dict):
+            continue
+        code = item.get("htsno") or item.get("hts_number") or item.get("htsNo")
+        description = item.get("description") or item.get("desc")
+        if not code and not description:
+            continue
+        normalized.append({
+            "hts_number": str(code) if code is not None else None,
+            "description": str(description) if description is not None else None,
+            "general_rate": item.get("general"),
+            "special_rate": item.get("special"),
+            "column_2_rate": item.get("other"),
+            "units": item.get("units"),
+            "indent": item.get("indent"),
+            "footnotes": item.get("footnotes"),
+            "publication_id": item.get("publication_id") or item.get("publicationId"),
+        })
+    return normalized
+
+
+@router.post("/customs/hs-code/lookup")
+def lookup_us_customs_hs_code(
+    payload: dict,
+    authorization: str = Header(default=""),
+    x_organization_id: str = Header(default=""),
+):
+    _db, _, _org_id = _auth_context(authorization, x_organization_id)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="A JSON object is required.")
+
+    import_country = str(payload.get("import_country") or "").strip()
+    if import_country.casefold() not in {"us", "usa", "u.s.", "united states", "united states of america"}:
+        raise HTTPException(
+            status_code=422,
+            detail="The connected official schedule is the United States HTSUS only. Non-U.S. import markets are not supported by this lookup.",
+        )
+
+    raw_code = str(payload.get("hs_code") or "").strip()
+    description = str(payload.get("product_description") or "").strip()
+    if raw_code:
+        code_check = _hs_code_format_check(raw_code)
+        if not code_check["valid_format"]:
+            raise HTTPException(status_code=422, detail=code_check["message"])
+        keyword = code_check["normalized_code"]
+        search_mode = "hts_code_or_schedule_text"
+    else:
+        if not description:
+            raise HTTPException(status_code=422, detail="Provide hs_code or product_description.")
+        if len(description) > 120:
+            raise HTTPException(status_code=422, detail="product_description must be 120 characters or fewer.")
+        keyword = description
+        search_mode = "product_description_keyword"
+
+    source_url = "https://hts.usitc.gov/reststop/search"
+    try:
+        import httpx
+        response = httpx.get(
+            source_url,
+            params={"keyword": keyword},
+            timeout=httpx.Timeout(8.0, connect=3.0),
+            headers={"Accept": "application/json", "User-Agent": "AGS-Pulse-Trade-Documents/1.0"},
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").casefold()
+        body_prefix = response.text.lstrip()[:1]
+        if "json" not in content_type and body_prefix not in {"[", "{"}:
+            raise ValueError("USITC returned a non-JSON response.")
+        data = response.json()
+        records = _usitc_search_records(data)
+    except Exception as exc:
+        logger.warning("USITC HTS lookup unavailable: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="The official USITC HTS lookup is temporarily unavailable or returned an unexpected response. No classification was verified.",
+        )
+
+    normalized_code = re.sub(r"[ .-]", "", raw_code)
+    if normalized_code:
+        exact = [
+            row for row in records
+            if re.sub(r"[^0-9]", "", str(row.get("hts_number") or "")) == normalized_code
+        ]
+        records = exact or records
+
+    return {
+        "success": True,
+        "market": "United States",
+        "schedule": "Harmonized Tariff Schedule of the United States (HTSUS)",
+        "search_mode": search_mode,
+        "query": keyword,
+        "result_count": len(records),
+        "results": records[:50],
+        "source": "United States International Trade Commission (USITC)",
+        "source_url": source_url,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "classification_status": "CANDIDATES_RETRIEVED_NOT_CLASSIFIED",
+        "tariff_rates_status": "SOURCE_DATA_RETRIEVED_ADVISORY",
+        "human_customs_review_required": True,
+        "important_notice": "USITC search results are candidate schedule entries, not a legally binding classification or complete duty calculation. Search results may omit related provisions, Chapter 99 measures, trade remedies, origin rules, and current CBP rulings. Confirm the current HTSUS and obtain qualified customs review before filing.",
+    }
