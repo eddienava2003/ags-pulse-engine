@@ -6,3 +6,4 @@ supabase
 openai
 reportlab
 python-docx
+pypdf
