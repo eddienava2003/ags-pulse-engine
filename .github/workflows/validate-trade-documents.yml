@@ -15,6 +15,7 @@ on:
       - "main.py"
       - "trade_documents.py"
       - "requirements.txt"
+      - "tests/**"
       - ".github/workflows/validate-trade-documents.yml"
 
 jobs:
