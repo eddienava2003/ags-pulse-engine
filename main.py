@@ -539,7 +539,55 @@ async def receive_aftership_webhook(request: Request):
     )[:200]
 
     try:
-        # Idempotency check happens before any shipment or telemetry mutation.
+        # Provider-keyed receipt makes webhook retries idempotent without
+        # creating a second generic telemetry event for the same update.
+        receipt = (
+            supabase.table("aftership_webhook_receipts")
+            .select("provider_event_key,status,genrai_event_id,shipment_id,telemetry_id")
+            .eq("provider_event_key", genrai_event_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if receipt and receipt[0].get("status") == "COMPLETE":
+            linked_id = receipt[0].get("genrai_event_id")
+            linked = (
+                supabase.table("genrai_telemetry_events")
+                .select("event_id,status,analyzed_at,engine_verdict,last_processing_error")
+                .eq("event_id", linked_id)
+                .limit(1)
+                .execute()
+            ).data or []
+            prior = linked[0] if linked else {}
+            return {
+                "success": True,
+                "duplicate": True,
+                "event_id": linked_id or genrai_event_id,
+                "status": prior.get("status", "COMPLETE"),
+                "analyzed_at": prior.get("analyzed_at"),
+                "engine_verdict": prior.get("engine_verdict"),
+                "last_processing_error": prior.get("last_processing_error"),
+                "processing_pending": prior.get("status") in {"PENDING_ANALYSIS", "PROCESSING"}
+            }
+        if receipt and receipt[0].get("status") == "PROCESSING":
+            return {
+                "success": True, "duplicate": True, "processing_pending": True,
+                "event_id": receipt[0].get("genrai_event_id") or genrai_event_id,
+                "status": "PROCESSING"
+            }
+        if receipt:
+            supabase.table("aftership_webhook_receipts").update({
+                "event_fingerprint": event_fingerprint,
+                "status": "PROCESSING",
+                "last_error": None,
+                "completed_at": None
+            }).eq("provider_event_key", genrai_event_id).execute()
+        else:
+            supabase.table("aftership_webhook_receipts").insert({
+                "provider_event_key": genrai_event_id,
+                "event_fingerprint": event_fingerprint,
+                "status": "PROCESSING"
+            }).execute()
+
         existing = (
             supabase.table("genrai_telemetry_events")
             .select("event_id,status,event_type,analyzed_at,engine_verdict,last_processing_error")
@@ -548,23 +596,9 @@ async def receive_aftership_webhook(request: Request):
             .execute()
         ).data or []
         unmatched_existing = bool(
-            existing
-            and existing[0].get("status") == "UNMATCHED"
+            existing and existing[0].get("status") == "UNMATCHED"
             and existing[0].get("event_type") == "AFTERSHIP_UNMATCHED"
         )
-        if existing and not unmatched_existing:
-            prior = existing[0]
-            prior_status = prior.get("status")
-            return {
-                "success": True,
-                "duplicate": True,
-                "event_id": genrai_event_id,
-                "status": prior_status,
-                "analyzed_at": prior.get("analyzed_at"),
-                "engine_verdict": prior.get("engine_verdict"),
-                "last_processing_error": prior.get("last_processing_error"),
-                "processing_pending": prior_status in {"PENDING_ANALYSIS", "PROCESSING"}
-            }
         if unmatched_existing:
             logger.info("Retrying retained unmatched AfterShip event: event_id=%s", genrai_event_id)
 
@@ -627,6 +661,12 @@ async def receive_aftership_webhook(request: Request):
                     "status": "UNMATCHED",
                     "last_processing_error": unmatched_reason
                 }).execute()
+            supabase.table("aftership_webhook_receipts").update({
+                "status": "COMPLETE",
+                "genrai_event_id": genrai_event_id,
+                "completed_at": now_utc(),
+                "last_error": unmatched_reason
+            }).eq("provider_event_key", genrai_event_id).execute()
             logger.warning(
                 "AfterShip event retained unmatched: event_id=%s carrier_slug=%s carrier_tracking_number_present=%s internal_reference_present=%s",
                 genrai_event_id, carrier_slug or None, bool(carrier_tracking_number), bool(internal_reference)
@@ -682,6 +722,10 @@ async def receive_aftership_webhook(request: Request):
                 detail="Explicit production telemetry reference is missing or invalid; refusing an unsafe write."
             )
         telemetry_id = telemetry["id"]
+        supabase.table("aftership_webhook_receipts").update({
+            "shipment_id": shipment_id,
+            "telemetry_id": telemetry_id
+        }).eq("provider_event_key", genrai_event_id).execute()
 
         checkpoints = tracking_obj.get("checkpoints") or msg.get("checkpoints") or []
         checkpoints = [item for item in checkpoints if isinstance(item, dict)] if isinstance(checkpoints, list) else []
@@ -924,6 +968,12 @@ async def receive_aftership_webhook(request: Request):
             raise RuntimeError("GENRAI event could not be read back after insertion.")
         result = processed[0]
         result_status = result.get("status")
+        supabase.table("aftership_webhook_receipts").update({
+            "status": "COMPLETE",
+            "genrai_event_id": genrai_event_id,
+            "completed_at": now_utc(),
+            "last_error": None
+        }).eq("provider_event_key", genrai_event_id).execute()
         return {
             "success": result_status in {"ANALYZED", "REJECTED", "PENDING_ANALYSIS", "PROCESSING"},
             "accepted": True,
@@ -942,8 +992,22 @@ async def receive_aftership_webhook(request: Request):
         }
 
     except HTTPException:
+        try:
+            supabase.table("aftership_webhook_receipts").update({
+                "status": "FAILED",
+                "last_error": "Webhook processing failed; retry is permitted."
+            }).eq("provider_event_key", genrai_event_id).eq("status", "PROCESSING").execute()
+        except Exception:
+            logger.exception("Failed to release AfterShip receipt after HTTP error.")
         raise
     except Exception:
+        try:
+            supabase.table("aftership_webhook_receipts").update({
+                "status": "FAILED",
+                "last_error": "Webhook processing failed; retry is permitted."
+            }).eq("provider_event_key", genrai_event_id).eq("status", "PROCESSING").execute()
+        except Exception:
+            logger.exception("Failed to release AfterShip receipt after processing error.")
         logger.exception("AfterShip webhook processing failed.")
         raise HTTPException(status_code=503, detail="AfterShip event processing failed.")
 
