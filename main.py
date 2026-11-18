@@ -543,7 +543,7 @@ async def receive_aftership_webhook(request: Request):
         # creating a second generic telemetry event for the same update.
         receipt = (
             supabase.table("aftership_webhook_receipts")
-            .select("provider_event_key,status,genrai_event_id,shipment_id,telemetry_id")
+            .select("provider_event_key,status,genrai_event_id,shipment_id,telemetry_id,received_at")
             .eq("provider_event_key", genrai_event_id)
             .limit(1)
             .execute()
@@ -569,11 +569,25 @@ async def receive_aftership_webhook(request: Request):
                 "processing_pending": prior.get("status") in {"PENDING_ANALYSIS", "PROCESSING"}
             }
         if receipt and receipt[0].get("status") == "PROCESSING":
-            return {
-                "success": True, "duplicate": True, "processing_pending": True,
-                "event_id": receipt[0].get("genrai_event_id") or genrai_event_id,
-                "status": "PROCESSING"
-            }
+            try:
+                processing_started = datetime.fromisoformat(
+                    receipt[0]["received_at"].replace("Z", "+00:00")
+                )
+                processing_age = (
+                    datetime.now(timezone.utc) - processing_started
+                ).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                processing_age = 0
+            if processing_age < 600:
+                return {
+                    "success": True, "duplicate": True, "processing_pending": True,
+                    "event_id": receipt[0].get("genrai_event_id") or genrai_event_id,
+                    "status": "PROCESSING"
+                }
+            supabase.table("aftership_webhook_receipts").update({
+                "status": "FAILED",
+                "last_error": "Expired processing lease; retrying provider delivery."
+            }).eq("provider_event_key", genrai_event_id).eq("status", "PROCESSING").execute()
         if receipt:
             supabase.table("aftership_webhook_receipts").update({
                 "event_fingerprint": event_fingerprint,
