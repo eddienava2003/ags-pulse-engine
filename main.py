@@ -592,6 +592,7 @@ async def receive_aftership_webhook(request: Request):
             supabase.table("aftership_webhook_receipts").update({
                 "event_fingerprint": event_fingerprint,
                 "status": "PROCESSING",
+                "received_at": now_utc(),
                 "last_error": None,
                 "completed_at": None
             }).eq("provider_event_key", genrai_event_id).execute()
