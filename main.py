@@ -539,17 +539,20 @@ async def receive_aftership_webhook(request: Request):
     )[:200]
 
     try:
-        # Provider-keyed receipt makes webhook retries idempotent without
-        # creating a second generic telemetry event for the same update.
-        receipt = (
-            supabase.table("aftership_webhook_receipts")
-            .select("provider_event_key,status,genrai_event_id,shipment_id,telemetry_id,received_at")
-            .eq("provider_event_key", genrai_event_id)
-            .limit(1)
-            .execute()
-        ).data or []
-        if receipt and receipt[0].get("status") == "COMPLETE":
-            linked_id = receipt[0].get("genrai_event_id")
+        # Atomically claim this provider event. Only the request that inserts
+        # a new receipt or takes over an expired/failed lease may process it.
+        claim_rows = supabase.rpc(
+            "claim_aftership_webhook_receipt",
+            {
+                "p_provider_event_key": genrai_event_id,
+                "p_event_fingerprint": event_fingerprint
+            }
+        ).execute().data or []
+        claim = claim_rows[0] if claim_rows else {}
+        claim_status = claim.get("claim_status")
+        linked_id = claim.get("linked_genrai_event_id") or genrai_event_id
+
+        if claim_status == "COMPLETE":
             linked = (
                 supabase.table("genrai_telemetry_events")
                 .select("event_id,status,analyzed_at,engine_verdict,last_processing_error")
@@ -561,47 +564,27 @@ async def receive_aftership_webhook(request: Request):
             return {
                 "success": True,
                 "duplicate": True,
-                "event_id": linked_id or genrai_event_id,
+                "event_id": linked_id,
                 "status": prior.get("status", "COMPLETE"),
                 "analyzed_at": prior.get("analyzed_at"),
                 "engine_verdict": prior.get("engine_verdict"),
                 "last_processing_error": prior.get("last_processing_error"),
                 "processing_pending": prior.get("status") in {"PENDING_ANALYSIS", "PROCESSING"}
             }
-        if receipt and receipt[0].get("status") == "PROCESSING":
-            try:
-                processing_started = datetime.fromisoformat(
-                    receipt[0]["received_at"].replace("Z", "+00:00")
-                )
-                processing_age = (
-                    datetime.now(timezone.utc) - processing_started
-                ).total_seconds()
-            except (KeyError, TypeError, ValueError):
-                processing_age = 0
-            if processing_age < 600:
-                return {
-                    "success": True, "duplicate": True, "processing_pending": True,
-                    "event_id": receipt[0].get("genrai_event_id") or genrai_event_id,
-                    "status": "PROCESSING"
-                }
-            supabase.table("aftership_webhook_receipts").update({
-                "status": "FAILED",
-                "last_error": "Expired processing lease; retrying provider delivery."
-            }).eq("provider_event_key", genrai_event_id).eq("status", "PROCESSING").execute()
-        if receipt:
-            supabase.table("aftership_webhook_receipts").update({
-                "event_fingerprint": event_fingerprint,
-                "status": "PROCESSING",
-                "received_at": now_utc(),
-                "last_error": None,
-                "completed_at": None
-            }).eq("provider_event_key", genrai_event_id).execute()
-        else:
-            supabase.table("aftership_webhook_receipts").insert({
-                "provider_event_key": genrai_event_id,
-                "event_fingerprint": event_fingerprint,
+
+        if claim_status == "PROCESSING":
+            return {
+                "success": True,
+                "duplicate": True,
+                "processing_pending": True,
+                "event_id": linked_id,
                 "status": "PROCESSING"
-            }).execute()
+            }
+
+        if claim_status != "CLAIMED":
+            raise RuntimeError(
+                "Atomic AfterShip receipt claim returned an unexpected state."
+            )
 
         existing = (
             supabase.table("genrai_telemetry_events")
