@@ -97,7 +97,7 @@ begin
     from public.organization_memberships
     where organization_id = p_organization_id and user_id = p_actor_user_id;
 
-    if actor_role not in ('owner','admin') then
+    if coalesce(actor_role, '') not in ('owner','admin') then
         raise exception 'Insufficient organization role' using errcode = '42501';
     end if;
 
