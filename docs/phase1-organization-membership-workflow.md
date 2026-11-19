@@ -77,3 +77,11 @@ The backend places a one-time invitation token in Supabase Auth invite metadata 
 Configure `SUPABASE_INVITE_REDIRECT_URL` in the backend environment to the approved app acceptance URL. Do not deploy until the template and redirect URL are configured and tested. The token is single-use, stored hashed in the database, and must never be logged.
 
 The current implementation intentionally does not support promoting a member to owner, changing existing roles, or removing members. Those administrative operations need a separate transactional last-owner-safe RPC and explicit tests before item 5 can be marked complete.
+
+## Implementation notes and constraints
+
+- Supabase Auth invitation links default to a one-hour expiry in this project configuration; the database invitation expiry is aligned to one hour. The email OTP expiry setting must be checked before deployment. If it differs, align the database default and API response.
+- Supabase Auth returns an error when `invite_user_by_email()` is used for an email that already belongs to a confirmed Auth user. This implementation cleans up the pending invitation record on delivery failure and grants no membership. Supporting already-registered users requires a separate verified email-delivery flow (for example, a custom invitation email provider); it is not silently treated as supported.
+- Only an owner can invite an admin, promote/demote owner/admin roles, or remove an owner/admin. Admins can administer dispatcher/member/viewer roles. The final owner cannot be demoted or removed.
+- The API now enables CORS for PATCH and DELETE because member role updates and removal use those methods.
+- The current endpoint implementation is still unmerged and untested against a disposable Supabase project. Do not apply either SQL file to production.
