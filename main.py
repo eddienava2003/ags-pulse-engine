@@ -1685,16 +1685,17 @@ def list_organization_members(
     """List membership records only for an organization the caller belongs to."""
     user = authenticated_user_from_header(authorization)
     caller_id = clean(getattr(user, "id", ""))
-    if organization_id not in [
-        clean(row.get("organization_id")) for row in (
+    try:
+        caller_memberships = (
             supabase.table("organization_memberships")
             .select("organization_id")
             .eq("user_id", caller_id)
             .execute()
         ).data or []
-    ]:
-        raise HTTPException(status_code=403, detail="You are not a member of this organization.")
-    try:
+        if organization_id not in [
+            clean(row.get("organization_id")) for row in caller_memberships
+        ]:
+            raise HTTPException(status_code=403, detail="You are not a member of this organization.")
         rows = (
             supabase.table("organization_memberships")
             .select("organization_id,user_id,member_role,created_at")
