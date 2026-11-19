@@ -17,9 +17,9 @@ Status: implementation design on an isolated branch; not deployed.
 1. An owner or admin can create an invitation only for an organization they belong to.
 2. Only owner/admin can invite users or change roles. Removing or demoting an owner requires owner authority.
 3. Invitation email is normalized and role is validated against the existing role vocabulary.
-4. The invitation has a cryptographically random, single-use token. Store only a keyed digest, never the raw token.
-5. Invitation expires (recommended: 7 days), can be revoked, and cannot be accepted twice.
-6. Acceptance requires a valid Supabase bearer token and a verified Auth email matching the invitation email. The organization/user pair is inserted idempotently.
+4. The invitation has a cryptographically random, single-use token. Store only a SHA-256 digest of the high-entropy token, never the raw token.
+5. Invitation expires after one hour (must be aligned with Supabase Auth invite-link expiry) and cannot be accepted twice. Invitation revocation is not implemented yet.
+6. Acceptance requires a valid Supabase bearer token and a verified Auth email matching the invitation email. It creates a membership once; an account already in the organization is rejected without consuming the invitation.
 7. A user cannot accept an invitation for a different email, change its organization, choose a different role, or self-assign a membership.
 8. Prevent removing/demoting the last active owner in a transaction.
 9. Return generic responses for unknown email addresses to avoid account enumeration.
@@ -46,7 +46,7 @@ Status: implementation design on an isolated branch; not deployed.
 - An admin cannot grant owner or remove/demote an owner unless explicitly permitted by the final role policy.
 - An owner can invite and administer members in their own organization only.
 - A user from organization A cannot list, invite, change, or remove members in organization B.
-- Invite email mismatch, expired token, revoked token, replayed token, and unverified email are rejected.
+- Invite email mismatch, expired token, replayed token, and unverified email are rejected. Revocation tests remain blocked until a revocation endpoint is implemented.
 - Acceptance creates exactly one membership for the invited organization and authenticated user.
 - Concurrent owner-removal attempts cannot leave an organization without an owner.
 - Existing shipment, event, route, checkpoint, and dashboard tenant-isolation tests remain passing.
