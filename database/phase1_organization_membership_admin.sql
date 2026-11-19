@@ -18,7 +18,7 @@ declare
 begin
     if p_organization_id is null or p_actor_user_id is null
        or p_target_user_id is null
-       or p_new_role not in ('owner','admin','dispatcher','member','viewer') then
+       or p_new_role is null or p_new_role not in ('owner','admin','dispatcher','member','viewer') then
         raise exception 'Invalid membership change request' using errcode = '22023';
     end if;
 
@@ -111,7 +111,7 @@ begin
     end if;
 
     if target_role in ('owner','admin') and actor_role <> 'owner' then
-        raise exception 'Only an owner may remove another owner' using errcode = '42501';
+        raise exception 'Only an owner may remove another owner or admin' using errcode = '42501';
     end if;
 
     if target_role = 'owner' then
