@@ -33,7 +33,7 @@ begin
     from public.organization_memberships
     where organization_id = p_organization_id and user_id = p_actor_user_id;
 
-    if actor_role not in ('owner','admin') then
+    if coalesce(actor_role, '') not in ('owner','admin') then
         raise exception 'Insufficient organization role' using errcode = '42501';
     end if;
 
@@ -46,7 +46,7 @@ begin
         raise exception 'Target member not found' using errcode = 'P0002';
     end if;
 
-    if actor_role <> 'owner' and (target_role = 'owner' or p_new_role in ('owner','admin')) then
+    if actor_role <> 'owner' and (target_role in ('owner','admin') or p_new_role in ('owner','admin')) then
         raise exception 'Only an owner may administer owner/admin roles' using errcode = '42501';
     end if;
 
@@ -110,7 +110,7 @@ begin
         raise exception 'Target member not found' using errcode = 'P0002';
     end if;
 
-    if target_role = 'owner' and actor_role <> 'owner' then
+    if target_role in ('owner','admin') and actor_role <> 'owner' then
         raise exception 'Only an owner may remove another owner' using errcode = '42501';
     end if;
 
