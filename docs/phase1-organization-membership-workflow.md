@@ -27,7 +27,7 @@ Status: implementation design on an isolated branch; not deployed.
 
 ## Implementation architecture
 
-- Add a private invitation table with RLS enabled and no client-facing policies or grants.
+- Add `public.organization_invitations` with RLS enabled and no anon/authenticated grants or policies; only the server-side service role can access it.
 - Add narrowly scoped database RPCs for atomic invitation acceptance and last-owner-safe role/removal operations. Revoke PUBLIC/anon execution; grant execution only to service_role.
 - Add API routes:
   - `POST /organizations/{organization_id}/invitations`
@@ -74,9 +74,9 @@ The backend places a one-time invitation token in Supabase Auth invite metadata 
 <p>After signing in and verifying this email, paste the token into the invitation acceptance screen.</p>
 ```
 
-Configure `SUPABASE_INVITE_REDIRECT_URL` in the backend environment to the approved app acceptance URL. Do not deploy until the template and redirect URL are configured and tested. The token is single-use, stored hashed in the database, and must never be logged.
+Configure `SUPABASE_INVITE_REDIRECT_URL` in the backend environment to the approved app acceptance URL. Do not deploy until the template and redirect URL are configured and tested. The token is single-use, stored as a SHA-256 digest of a high-entropy random token in the database, and must never be logged.
 
-The current implementation intentionally does not support promoting a member to owner, changing existing roles, or removing members. Those administrative operations need a separate transactional last-owner-safe RPC and explicit tests before item 5 can be marked complete.
+The current implementation includes role changes and member removal through transactional last-owner-safe RPCs, but these operations are untested and must pass the explicit tests above before item 5 can be marked complete. Invitation revocation is not yet implemented.
 
 ## Implementation notes and constraints
 
