@@ -9,7 +9,7 @@ create table if not exists public.organization_invitations (
     token_hash text not null unique,
     invited_by uuid not null references auth.users(id),
     status text not null default 'pending' check (status in ('pending','accepted','revoked','expired')),
-    expires_at timestamptz not null default (now() + interval '7 days'),
+    expires_at timestamptz not null default (now() + interval '1 hour'),
     accepted_by uuid references auth.users(id),
     accepted_at timestamptz,
     created_at timestamptz not null default now(),
