@@ -1786,7 +1786,7 @@ async def create_organization_invitation(
             "email": email,
             "member_role": role,
             "status": "pending",
-            "expires_in_days": 7
+            "expires_in_hours": 1
         }
     except HTTPException:
         raise
