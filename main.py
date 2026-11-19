@@ -1666,15 +1666,33 @@ def authenticated_user_from_header(authorization):
 
 
 def organization_member_role(organization_id, user_id):
-    rows = (
-        supabase.table("organization_memberships")
-        .select("member_role")
-        .eq("organization_id", organization_id)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-    ).data or []
-    return clean(rows[0].get("member_role")) if rows else ""
+    try:
+        rows = (
+            supabase.table("organization_memberships")
+            .select("member_role")
+            .eq("organization_id", organization_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        return clean(rows[0].get("member_role")) if rows else ""
+    except Exception:
+        logger.exception("Organization membership role lookup failed.")
+        raise HTTPException(status_code=503, detail="Organization authorization is temporarily unavailable.")
+
+
+def membership_rpc_http_exception(error):
+    """Translate known database authorization/constraint errors without masking outages as conflicts."""
+    code = clean(getattr(error, "code", ""))
+    if code == "42501":
+        return HTTPException(status_code=403, detail="Insufficient organization permissions.")
+    if code == "P0002":
+        return HTTPException(status_code=404, detail="Organization or member was not found.")
+    if code == "22023":
+        return HTTPException(status_code=422, detail="Invalid membership change request.")
+    if code in {"23505", "23514"}:
+        return HTTPException(status_code=409, detail="Membership change conflicts with organization rules.")
+    return HTTPException(status_code=503, detail="Membership service is temporarily unavailable.")
 
 
 @app.get("/organizations/{organization_id}/members")
@@ -1790,13 +1808,15 @@ async def create_organization_invitation(
         }
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("Organization invitation delivery failed.")
         if invitation_id:
             try:
                 supabase.table("organization_invitations").delete().eq("id", invitation_id).execute()
             except Exception:
                 logger.exception("Failed to clean up undelivered organization invitation.")
+        if clean(getattr(exc, "code", "")) == "23505":
+            raise HTTPException(status_code=409, detail="A pending invitation already exists for this email.")
         raise HTTPException(status_code=503, detail="Invitation could not be sent. No membership was granted.")
 
 
@@ -1837,9 +1857,9 @@ async def update_organization_member_role(
         return data
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("Organization member role update rejected or unavailable.")
-        raise HTTPException(status_code=409, detail="Role change was rejected or could not be completed.")
+        raise membership_rpc_http_exception(exc)
 
 
 @app.delete("/organizations/{organization_id}/members/{target_user_id}")
@@ -1866,9 +1886,11 @@ def remove_organization_member(
         if not isinstance(data, dict) or not data.get("success"):
             raise RuntimeError("Member removal did not return confirmation.")
         return data
-    except Exception:
+    except HTTPException:
+        raise
+    except Exception as exc:
         logger.exception("Organization member removal rejected or unavailable.")
-        raise HTTPException(status_code=409, detail="Member removal was rejected or could not be completed.")
+        raise membership_rpc_http_exception(exc)
 
 
 @app.post("/organization-invitations/accept")
