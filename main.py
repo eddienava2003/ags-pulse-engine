@@ -1739,8 +1739,10 @@ async def create_organization_invitation(
     role = clean(payload.get("member_role") or "member").casefold()
     if len(email) > 320 or "@" not in email or email.startswith("@") or email.endswith("@"):
         raise HTTPException(status_code=422, detail="A valid email address is required.")
-    if role not in {"dispatcher", "member", "viewer"}:
-        raise HTTPException(status_code=422, detail="Invitations may assign dispatcher, member, or viewer roles only.")
+    if role not in {"admin", "dispatcher", "member", "viewer"}:
+        raise HTTPException(status_code=422, detail="member_role must be admin, dispatcher, member, or viewer.")
+    if role == "admin" and caller_role != "owner":
+        raise HTTPException(status_code=403, detail="Only an owner may invite an administrator.")
 
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -1796,6 +1798,77 @@ async def create_organization_invitation(
             except Exception:
                 logger.exception("Failed to clean up undelivered organization invitation.")
         raise HTTPException(status_code=503, detail="Invitation could not be sent. No membership was granted.")
+
+
+@app.patch("/organizations/{organization_id}/members/{target_user_id}")
+async def update_organization_member_role(
+    organization_id: str,
+    target_user_id: str,
+    request: Request,
+    authorization: str = Header(default="")
+):
+    """Change a member role with owner/admin authorization and last-owner safeguards."""
+    user = authenticated_user_from_header(authorization)
+    actor_id = clean(getattr(user, "id", ""))
+    actor_role = organization_member_role(organization_id, actor_id)
+    if actor_role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only organization owners and admins can change member roles.")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    new_role = clean(payload.get("member_role")).casefold() if isinstance(payload, dict) else ""
+    if new_role not in {"owner", "admin", "dispatcher", "member", "viewer"}:
+        raise HTTPException(status_code=422, detail="A valid member_role is required.")
+    if actor_role != "owner" and new_role in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only an owner may assign owner or admin roles.")
+    try:
+        result = supabase.rpc("change_organization_member_role", {
+            "p_organization_id": organization_id,
+            "p_actor_user_id": actor_id,
+            "p_target_user_id": target_user_id,
+            "p_new_role": new_role
+        }).execute()
+        data = result.data
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError("Role update did not return confirmation.")
+        return data
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Organization member role update rejected or unavailable.")
+        raise HTTPException(status_code=409, detail="Role change was rejected or could not be completed.")
+
+
+@app.delete("/organizations/{organization_id}/members/{target_user_id}")
+def remove_organization_member(
+    organization_id: str,
+    target_user_id: str,
+    authorization: str = Header(default="")
+):
+    """Remove a member with owner/admin authorization and last-owner safeguards."""
+    user = authenticated_user_from_header(authorization)
+    actor_id = clean(getattr(user, "id", ""))
+    actor_role = organization_member_role(organization_id, actor_id)
+    if actor_role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only organization owners and admins can remove members.")
+    try:
+        result = supabase.rpc("remove_organization_member", {
+            "p_organization_id": organization_id,
+            "p_actor_user_id": actor_id,
+            "p_target_user_id": target_user_id
+        }).execute()
+        data = result.data
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError("Member removal did not return confirmation.")
+        return data
+    except Exception:
+        logger.exception("Organization member removal rejected or unavailable.")
+        raise HTTPException(status_code=409, detail="Member removal was rejected or could not be completed.")
 
 
 @app.post("/organization-invitations/accept")
