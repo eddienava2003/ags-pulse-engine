@@ -1644,6 +1644,199 @@ def list_organization_route_assessments(
         raise HTTPException(status_code=503, detail="Organization route assessments are temporarily unavailable.")
 
 # --------------------------------------------------
+# --------------------------------------------------
+# ORGANIZATION MEMBERSHIP AND INVITATIONS
+# --------------------------------------------------
+
+def authenticated_user_from_header(authorization):
+    scheme, separator, token = clean(authorization).partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="A valid Bearer access token is required.")
+    try:
+        response = supabase.auth.get_user(token.strip())
+        user = getattr(response, "user", None)
+        user_id = clean(getattr(user, "id", ""))
+        if not user_id:
+            raise ValueError("Missing authenticated user.")
+        return user
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+
+
+def organization_member_role(organization_id, user_id):
+    rows = (
+        supabase.table("organization_memberships")
+        .select("member_role")
+        .eq("organization_id", organization_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    return clean(rows[0].get("member_role")) if rows else ""
+
+
+@app.get("/organizations/{organization_id}/members")
+def list_organization_members(
+    organization_id: str,
+    authorization: str = Header(default="")
+):
+    """List membership records only for an organization the caller belongs to."""
+    user = authenticated_user_from_header(authorization)
+    caller_id = clean(getattr(user, "id", ""))
+    if organization_id not in [
+        clean(row.get("organization_id")) for row in (
+            supabase.table("organization_memberships")
+            .select("organization_id")
+            .eq("user_id", caller_id)
+            .execute()
+        ).data or []
+    ]:
+        raise HTTPException(status_code=403, detail="You are not a member of this organization.")
+    try:
+        rows = (
+            supabase.table("organization_memberships")
+            .select("organization_id,user_id,member_role,created_at")
+            .eq("organization_id", organization_id)
+            .order("created_at")
+            .execute()
+        ).data or []
+        return {"success": True, "organization_id": organization_id, "members": rows, "total": len(rows)}
+    except Exception:
+        logger.exception("Organization member listing failed.")
+        raise HTTPException(status_code=503, detail="Organization members are temporarily unavailable.")
+
+
+@app.post("/organizations/{organization_id}/invitations", status_code=201)
+async def create_organization_invitation(
+    organization_id: str,
+    request: Request,
+    authorization: str = Header(default="")
+):
+    """Invite a verified email into an organization without granting membership before acceptance."""
+    user = authenticated_user_from_header(authorization)
+    caller_id = clean(getattr(user, "id", ""))
+    try:
+        caller_role = organization_member_role(organization_id, caller_id)
+    except Exception:
+        logger.exception("Invitation authorization lookup failed.")
+        raise HTTPException(status_code=503, detail="Organization authorization is temporarily unavailable.")
+    if caller_role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only organization owners and admins can invite members.")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required.")
+
+    email = clean(payload.get("email")).casefold()
+    role = clean(payload.get("member_role") or "member").casefold()
+    if len(email) > 320 or "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(status_code=422, detail="A valid email address is required.")
+    if role not in {"dispatcher", "member", "viewer"}:
+        raise HTTPException(status_code=422, detail="Invitations may assign dispatcher, member, or viewer roles only.")
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    invitation_id = None
+    try:
+        existing = (
+            supabase.table("organization_invitations")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .eq("email", email)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        ).data or []
+        if existing:
+            raise HTTPException(status_code=409, detail="A pending invitation already exists for this email.")
+
+        inserted = supabase.table("organization_invitations").insert({
+            "organization_id": organization_id,
+            "email": email,
+            "member_role": role,
+            "token_hash": token_hash,
+            "invited_by": caller_id,
+            "status": "pending"
+        }).execute()
+        inserted_rows = inserted.data or []
+        if not inserted_rows:
+            raise RuntimeError("Invitation record was not created.")
+        invitation_id = inserted_rows[0].get("id")
+
+        redirect_to = os.getenv("SUPABASE_INVITE_REDIRECT_URL", "").strip() or None
+        options = {"data": {"ags_invitation_token": token}}
+        if redirect_to:
+            options["redirect_to"] = redirect_to
+        supabase.auth.admin.invite_user_by_email(email, options=options)
+
+        return {
+            "success": True,
+            "invitation_id": invitation_id,
+            "organization_id": organization_id,
+            "email": email,
+            "member_role": role,
+            "status": "pending",
+            "expires_in_days": 7
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Organization invitation delivery failed.")
+        if invitation_id:
+            try:
+                supabase.table("organization_invitations").delete().eq("id", invitation_id).execute()
+            except Exception:
+                logger.exception("Failed to clean up undelivered organization invitation.")
+        raise HTTPException(status_code=503, detail="Invitation could not be sent. No membership was granted.")
+
+
+@app.post("/organization-invitations/accept")
+async def accept_organization_invitation(
+    request: Request,
+    authorization: str = Header(default="")
+):
+    """Accept a single-use invitation only for the authenticated, verified email."""
+    user = authenticated_user_from_header(authorization)
+    user_id = clean(getattr(user, "id", ""))
+    email = clean(getattr(user, "email", "")).casefold()
+    verified_at = (
+        getattr(user, "email_confirmed_at", None)
+        or getattr(user, "confirmed_at", None)
+    )
+    if not email or not verified_at:
+        raise HTTPException(status_code=403, detail="A verified email address is required to accept an invitation.")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    invitation_token = clean(payload.get("invitation_token")) if isinstance(payload, dict) else ""
+    if len(invitation_token) < 32 or len(invitation_token) > 256:
+        raise HTTPException(status_code=422, detail="A valid invitation token is required.")
+
+    token_hash = hashlib.sha256(invitation_token.encode("utf-8")).hexdigest()
+    try:
+        result = supabase.rpc("accept_organization_invitation", {
+            "p_token_hash": token_hash,
+            "p_user_id": user_id,
+            "p_verified_email": email
+        }).execute()
+        data = result.data
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError("Invitation acceptance did not return confirmation.")
+        return data
+    except Exception:
+        logger.info("Organization invitation acceptance rejected or unavailable for user_id=%s", user_id)
+        raise HTTPException(status_code=400, detail="Invitation is invalid, expired, already used, or does not match this account.")
+
+
 # ORGANIZATION-SCOPED SHIPMENT LIST (READ-ONLY)
 # --------------------------------------------------
 
