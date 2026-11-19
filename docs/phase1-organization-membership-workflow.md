@@ -63,3 +63,17 @@ Status: implementation design on an isolated branch; not deployed.
 ## Known dependency
 
 The current project has one known Auth user/account and one organization. A second independent Auth identity is still required for the final end-to-end tenant-isolation test. Implementation and static authorization tests can proceed without it, but this does not replace that production verification.
+
+## Invitation email configuration required
+
+The backend places a one-time invitation token in Supabase Auth invite metadata as `ags_invitation_token`. The project's Auth **Invite user** email template must render this value and direct the user to the application's acceptance screen. For example:
+
+```html
+<p>You have been invited to join an AGS-Pulse organization.</p>
+<p>Invitation token: {{ .Data.ags_invitation_token }}</p>
+<p>After signing in and verifying this email, paste the token into the invitation acceptance screen.</p>
+```
+
+Configure `SUPABASE_INVITE_REDIRECT_URL` in the backend environment to the approved app acceptance URL. Do not deploy until the template and redirect URL are configured and tested. The token is single-use, stored hashed in the database, and must never be logged.
+
+The current implementation intentionally does not support promoting a member to owner, changing existing roles, or removing members. Those administrative operations need a separate transactional last-owner-safe RPC and explicit tests before item 5 can be marked complete.
