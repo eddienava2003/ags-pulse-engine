@@ -1930,9 +1930,9 @@ async def accept_organization_invitation(
         if not isinstance(data, dict) or not data.get("success"):
             raise RuntimeError("Invitation acceptance did not return confirmation.")
         return data
-    except Exception:
-        logger.info("Organization invitation acceptance rejected or unavailable for user_id=%s", user_id)
-        raise HTTPException(status_code=400, detail="Invitation is invalid, expired, already used, or does not match this account.")
+    except Exception as exc:
+        logger.exception("Organization invitation acceptance failed for user_id=%s", user_id)
+        raise membership_rpc_http_exception(exc)
 
 
 # ORGANIZATION-SCOPED SHIPMENT LIST (READ-ONLY)
