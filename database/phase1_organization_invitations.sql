@@ -63,9 +63,19 @@ begin
         raise exception 'Invitation email does not match authenticated account' using errcode = '42501';
     end if;
 
+    -- Do not consume an invitation or report a role that was not granted
+    -- when the authenticated account is already a member of this organization.
+    if exists (
+        select 1
+        from public.organization_memberships
+        where organization_id = invitation.organization_id
+          and user_id = p_user_id
+    ) then
+        raise exception 'User is already a member of this organization' using errcode = '23505';
+    end if;
+
     insert into public.organization_memberships (organization_id, user_id, member_role)
-    values (invitation.organization_id, p_user_id, invitation.member_role)
-    on conflict (organization_id, user_id) do nothing;
+    values (invitation.organization_id, p_user_id, invitation.member_role);
 
     update public.organization_invitations
     set status = 'accepted',
