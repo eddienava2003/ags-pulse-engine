@@ -76,6 +76,8 @@ The backend places a one-time invitation token in Supabase Auth invite metadata 
 
 Configure `SUPABASE_INVITE_REDIRECT_URL` in the backend environment to the approved app acceptance URL. Do not deploy until the template and redirect URL are configured and tested. The token is single-use, stored as a SHA-256 digest of a high-entropy random token in the database, and must never be logged.
 
+**SMTP plan gate:** The AGS-Pulse Supabase organization is currently on the Free plan, and the project was created after June 3, 2026. New Free-plan projects using Supabase's default SMTP cannot customize Auth email templates. The actual SMTP provider has not yet been verified. Before treating this invitation flow as usable, confirm whether custom SMTP is configured. If the project uses default SMTP, configure a supported custom SMTP provider before relying on the `{{ .Data.ags_invitation_token }}` template field, or replace this delivery path with a separately tested custom invitation-email workflow. Do not assume the token reaches the invitee merely because it is present in Auth user metadata.
+
 The current implementation includes role changes and member removal through transactional last-owner-safe RPCs, but these operations are untested and must pass the explicit tests above before item 5 can be marked complete. Invitation revocation is not yet implemented.
 
 ## Implementation notes and constraints
