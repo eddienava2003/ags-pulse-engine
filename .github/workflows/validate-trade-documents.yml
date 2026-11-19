@@ -1,0 +1,34 @@
+name: Validate trade document backend
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "trade_documents.py"
+      - "requirements.txt"
+      - "tests/**"
+      - ".github/workflows/validate-trade-documents.yml"
+  push:
+    branches: [feature/trade-document-backend]
+    paths:
+      - "main.py"
+      - "trade_documents.py"
+      - "requirements.txt"
+      - "tests/**"
+      - ".github/workflows/validate-trade-documents.yml"
+
+jobs:
+  python-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+      - name: Compile backend modules
+        run: python -m compileall -q main.py trade_documents.py tests
+      - name: Run document backend tests
+        run: python -m unittest discover -s tests -v
