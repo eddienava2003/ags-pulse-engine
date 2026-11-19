@@ -1704,6 +1704,8 @@ def list_organization_members(
             .execute()
         ).data or []
         return {"success": True, "organization_id": organization_id, "members": rows, "total": len(rows)}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Organization member listing failed.")
         raise HTTPException(status_code=503, detail="Organization members are temporarily unavailable.")
