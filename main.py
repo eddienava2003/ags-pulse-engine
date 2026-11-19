@@ -1817,6 +1817,33 @@ async def create_organization_shipment(
         x_organization_id
     )
 
+    # Shipment creation is a write operation: viewers may read their tenant's
+    # data but only operational roles may create shipments.
+    scheme, separator, token = clean(authorization).partition(" ")
+    if not separator or scheme.casefold() != "bearer":
+        raise HTTPException(status_code=401, detail="A valid Bearer access token is required.")
+    try:
+        auth_response = supabase.auth.get_user(token.strip())
+        user_id = clean(getattr(getattr(auth_response, "user", None), "id", ""))
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+        membership = (
+            supabase.table("organization_memberships")
+            .select("member_role")
+            .eq("organization_id", organization_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        role = clean(membership[0].get("member_role")) if membership else ""
+        if role not in {"owner", "admin", "dispatcher", "member"}:
+            raise HTTPException(status_code=403, detail="Your organization role cannot create shipments.")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Shipment creation authorization failed.")
+        raise HTTPException(status_code=503, detail="Shipment authorization is temporarily unavailable.")
+
     try:
         payload = await request.json()
     except Exception:
