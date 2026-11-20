@@ -50,12 +50,17 @@ begin
         raise exception 'Invitation is invalid or unavailable' using errcode = 'P0002';
     end if;
 
-    if invitation.status <> 'pending' or invitation.expires_at <= now() then
-        if invitation.status = 'pending' and invitation.expires_at <= now() then
-            update public.organization_invitations
-            set status = 'expired', updated_at = now()
-            where id = invitation.id;
-        end if;
+    if invitation.status = 'pending' and invitation.expires_at <= now() then
+        -- Return normally so this status change commits instead of being rolled back
+        -- by an exception in the same transaction.
+        update public.organization_invitations
+        set status = 'expired', updated_at = now()
+        where id = invitation.id;
+
+        return jsonb_build_object('success', false, 'error', 'invitation_expired');
+    end if;
+
+    if invitation.status <> 'pending' then
         raise exception 'Invitation is invalid or unavailable' using errcode = 'P0002';
     end if;
 
