@@ -38,7 +38,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Organization-ID", "X-GENRAI-TOKEN"]
 )
 
@@ -1644,6 +1644,309 @@ def list_organization_route_assessments(
         raise HTTPException(status_code=503, detail="Organization route assessments are temporarily unavailable.")
 
 # --------------------------------------------------
+# --------------------------------------------------
+# ORGANIZATION MEMBERSHIP AND INVITATIONS
+# --------------------------------------------------
+
+def authenticated_user_from_header(authorization):
+    scheme, separator, token = clean(authorization).partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="A valid Bearer access token is required.")
+    try:
+        response = supabase.auth.get_user(token.strip())
+        user = getattr(response, "user", None)
+        user_id = clean(getattr(user, "id", ""))
+        if not user_id:
+            raise ValueError("Missing authenticated user.")
+        return user
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+
+
+def organization_member_role(organization_id, user_id):
+    try:
+        rows = (
+            supabase.table("organization_memberships")
+            .select("member_role")
+            .eq("organization_id", organization_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        return clean(rows[0].get("member_role")) if rows else ""
+    except Exception:
+        logger.exception("Organization membership role lookup failed.")
+        raise HTTPException(status_code=503, detail="Organization authorization is temporarily unavailable.")
+
+
+def membership_rpc_http_exception(error):
+    """Translate known database authorization/constraint errors without masking outages as conflicts."""
+    code = clean(getattr(error, "code", ""))
+    if code == "42501":
+        return HTTPException(status_code=403, detail="Insufficient organization permissions.")
+    if code == "P0002":
+        return HTTPException(status_code=404, detail="Organization or member was not found.")
+    if code == "22023":
+        return HTTPException(status_code=422, detail="Invalid membership change request.")
+    if code in {"23505", "23514"}:
+        return HTTPException(status_code=409, detail="Membership change conflicts with organization rules.")
+    return HTTPException(status_code=503, detail="Membership service is temporarily unavailable.")
+
+
+@app.get("/organizations/{organization_id}/members")
+def list_organization_members(
+    organization_id: str,
+    authorization: str = Header(default="")
+):
+    """List membership records only for an organization the caller belongs to."""
+    user = authenticated_user_from_header(authorization)
+    caller_id = clean(getattr(user, "id", ""))
+    try:
+        caller_memberships = (
+            supabase.table("organization_memberships")
+            .select("organization_id")
+            .eq("user_id", caller_id)
+            .execute()
+        ).data or []
+        if organization_id not in [
+            clean(row.get("organization_id")) for row in caller_memberships
+        ]:
+            raise HTTPException(status_code=403, detail="You are not a member of this organization.")
+        rows = (
+            supabase.table("organization_memberships")
+            .select("organization_id,user_id,member_role,created_at")
+            .eq("organization_id", organization_id)
+            .order("created_at")
+            .execute()
+        ).data or []
+        return {"success": True, "organization_id": organization_id, "members": rows, "total": len(rows)}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Organization member listing failed.")
+        raise HTTPException(status_code=503, detail="Organization members are temporarily unavailable.")
+
+
+@app.post("/organizations/{organization_id}/invitations", status_code=201)
+async def create_organization_invitation(
+    organization_id: str,
+    request: Request,
+    authorization: str = Header(default="")
+):
+    """Invite a verified email into an organization without granting membership before acceptance."""
+    user = authenticated_user_from_header(authorization)
+    caller_id = clean(getattr(user, "id", ""))
+    try:
+        caller_role = organization_member_role(organization_id, caller_id)
+    except Exception:
+        logger.exception("Invitation authorization lookup failed.")
+        raise HTTPException(status_code=503, detail="Organization authorization is temporarily unavailable.")
+    if caller_role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only organization owners and admins can invite members.")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required.")
+
+    email = clean(payload.get("email")).casefold()
+    role = clean(payload.get("member_role") or "member").casefold()
+    if len(email) > 320 or "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(status_code=422, detail="A valid email address is required.")
+    if role not in {"admin", "dispatcher", "member", "viewer"}:
+        raise HTTPException(status_code=422, detail="member_role must be admin, dispatcher, member, or viewer.")
+    if role == "admin" and caller_role != "owner":
+        raise HTTPException(status_code=403, detail="Only an owner may invite an administrator.")
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    invitation_id = None
+    try:
+        # Expire stale invitations before checking the partial unique constraint.
+        supabase.table("organization_invitations").update({
+            "status": "expired",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("organization_id", organization_id).eq("email", email).eq("status", "pending").lte(
+            "expires_at", datetime.now(timezone.utc).isoformat()
+        ).execute()
+
+        existing = (
+            supabase.table("organization_invitations")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .eq("email", email)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        ).data or []
+        if existing:
+            raise HTTPException(status_code=409, detail="A pending invitation already exists for this email.")
+
+        inserted = supabase.table("organization_invitations").insert({
+            "organization_id": organization_id,
+            "email": email,
+            "member_role": role,
+            "token_hash": token_hash,
+            "invited_by": caller_id,
+            "status": "pending"
+        }).execute()
+        inserted_rows = inserted.data or []
+        if not inserted_rows:
+            raise RuntimeError("Invitation record was not created.")
+        invitation_id = inserted_rows[0].get("id")
+
+        redirect_to = os.getenv("SUPABASE_INVITE_REDIRECT_URL", "").strip() or None
+        options = {"data": {"ags_invitation_token": token}}
+        if redirect_to:
+            options["redirect_to"] = redirect_to
+        supabase.auth.admin.invite_user_by_email(email, options=options)
+
+        return {
+            "success": True,
+            "invitation_id": invitation_id,
+            "organization_id": organization_id,
+            "email": email,
+            "member_role": role,
+            "status": "pending",
+            "expires_in_hours": 1
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Organization invitation delivery failed.")
+        if invitation_id:
+            try:
+                supabase.table("organization_invitations").delete().eq("id", invitation_id).execute()
+            except Exception:
+                logger.exception("Failed to clean up undelivered organization invitation.")
+        if clean(getattr(exc, "code", "")) == "23505":
+            raise HTTPException(status_code=409, detail="A pending invitation already exists for this email.")
+        raise HTTPException(status_code=503, detail="Invitation could not be sent. No membership was granted.")
+
+
+@app.patch("/organizations/{organization_id}/members/{target_user_id}")
+async def update_organization_member_role(
+    organization_id: str,
+    target_user_id: str,
+    request: Request,
+    authorization: str = Header(default="")
+):
+    """Change a member role with owner/admin authorization and last-owner safeguards."""
+    user = authenticated_user_from_header(authorization)
+    actor_id = clean(getattr(user, "id", ""))
+    actor_role = organization_member_role(organization_id, actor_id)
+    if actor_role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only organization owners and admins can change member roles.")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    new_role = clean(payload.get("member_role")).casefold() if isinstance(payload, dict) else ""
+    if new_role not in {"owner", "admin", "dispatcher", "member", "viewer"}:
+        raise HTTPException(status_code=422, detail="A valid member_role is required.")
+    if actor_role != "owner" and new_role in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only an owner may assign owner or admin roles.")
+    try:
+        result = supabase.rpc("change_organization_member_role", {
+            "p_organization_id": organization_id,
+            "p_actor_user_id": actor_id,
+            "p_target_user_id": target_user_id,
+            "p_new_role": new_role
+        }).execute()
+        data = result.data
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError("Role update did not return confirmation.")
+        return data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Organization member role update rejected or unavailable.")
+        raise membership_rpc_http_exception(exc)
+
+
+@app.delete("/organizations/{organization_id}/members/{target_user_id}")
+def remove_organization_member(
+    organization_id: str,
+    target_user_id: str,
+    authorization: str = Header(default="")
+):
+    """Remove a member with owner/admin authorization and last-owner safeguards."""
+    user = authenticated_user_from_header(authorization)
+    actor_id = clean(getattr(user, "id", ""))
+    actor_role = organization_member_role(organization_id, actor_id)
+    if actor_role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only organization owners and admins can remove members.")
+    try:
+        result = supabase.rpc("remove_organization_member", {
+            "p_organization_id": organization_id,
+            "p_actor_user_id": actor_id,
+            "p_target_user_id": target_user_id
+        }).execute()
+        data = result.data
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError("Member removal did not return confirmation.")
+        return data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Organization member removal rejected or unavailable.")
+        raise membership_rpc_http_exception(exc)
+
+
+@app.post("/organization-invitations/accept")
+async def accept_organization_invitation(
+    request: Request,
+    authorization: str = Header(default="")
+):
+    """Accept a single-use invitation only for the authenticated, verified email."""
+    user = authenticated_user_from_header(authorization)
+    user_id = clean(getattr(user, "id", ""))
+    email = clean(getattr(user, "email", "")).casefold()
+    verified_at = (
+        getattr(user, "email_confirmed_at", None)
+        or getattr(user, "confirmed_at", None)
+    )
+    if not email or not verified_at:
+        raise HTTPException(status_code=403, detail="A verified email address is required to accept an invitation.")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
+    invitation_token = clean(payload.get("invitation_token")) if isinstance(payload, dict) else ""
+    if len(invitation_token) < 32 or len(invitation_token) > 256:
+        raise HTTPException(status_code=422, detail="A valid invitation token is required.")
+
+    token_hash = hashlib.sha256(invitation_token.encode("utf-8")).hexdigest()
+    try:
+        result = supabase.rpc("accept_organization_invitation", {
+            "p_token_hash": token_hash,
+            "p_user_id": user_id,
+            "p_verified_email": email
+        }).execute()
+        data = result.data
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, dict) and data.get("error") == "invitation_expired":
+            raise HTTPException(status_code=410, detail="This invitation has expired.")
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError("Invitation acceptance did not return confirmation.")
+        return data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Organization invitation acceptance failed for user_id=%s", user_id)
+        raise membership_rpc_http_exception(exc)
+
+
 # ORGANIZATION-SCOPED SHIPMENT LIST (READ-ONLY)
 # --------------------------------------------------
 
