@@ -1766,6 +1766,14 @@ async def create_organization_invitation(
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     invitation_id = None
     try:
+        # Expire stale invitations before checking the partial unique constraint.
+        supabase.table("organization_invitations").update({
+            "status": "expired",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("organization_id", organization_id).eq("email", email).eq("status", "pending").lte(
+            "expires_at", datetime.now(timezone.utc).isoformat()
+        ).execute()
+
         existing = (
             supabase.table("organization_invitations")
             .select("id")
@@ -1927,9 +1935,13 @@ async def accept_organization_invitation(
         data = result.data
         if isinstance(data, list) and data:
             data = data[0]
+        if isinstance(data, dict) and data.get("error") == "invitation_expired":
+            raise HTTPException(status_code=410, detail="This invitation has expired.")
         if not isinstance(data, dict) or not data.get("success"):
             raise RuntimeError("Invitation acceptance did not return confirmation.")
         return data
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Organization invitation acceptance failed for user_id=%s", user_id)
         raise membership_rpc_http_exception(exc)
