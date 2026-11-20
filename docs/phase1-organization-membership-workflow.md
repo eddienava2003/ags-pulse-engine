@@ -87,3 +87,11 @@ The current implementation includes role changes and member removal through tran
 - Only an owner can invite an admin, promote/demote owner/admin roles, or remove an owner/admin. Admins can administer dispatcher/member/viewer roles. The final owner cannot be demoted or removed.
 - The API now enables CORS for PATCH and DELETE because member role updates and removal use those methods.
 - The current endpoint implementation is still unmerged and untested against a disposable Supabase project. Do not apply either SQL file to production.
+
+
+## Expiry handling correction
+
+- Expired invitations are marked `expired` and returned as a normal RPC result, not raised as an exception, so PostgreSQL commits the status transition.
+- The API returns HTTP 410 for an expired token.
+- Invitation creation marks any expired pending invitation for the same organization/email as expired before checking for an existing pending invitation. This releases the partial unique index and permits a fresh invitation.
+- These changes are code-reviewed only; they still require migration and API integration tests in a disposable non-production Supabase environment.
