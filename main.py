@@ -1766,38 +1766,21 @@ async def create_organization_invitation(
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     invitation_id = None
     try:
-        # Expire stale invitations before checking the partial unique constraint.
-        supabase.table("organization_invitations").update({
-            "status": "expired",
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }).eq("organization_id", organization_id).eq("email", email).eq("status", "pending").lte(
-            "expires_at", datetime.now(timezone.utc).isoformat()
-        ).execute()
-
-        existing = (
-            supabase.table("organization_invitations")
-            .select("id")
-            .eq("organization_id", organization_id)
-            .eq("email", email)
-            .eq("status", "pending")
-            .limit(1)
-            .execute()
-        ).data or []
-        if existing:
-            raise HTTPException(status_code=409, detail="A pending invitation already exists for this email.")
-
-        inserted = supabase.table("organization_invitations").insert({
-            "organization_id": organization_id,
-            "email": email,
-            "member_role": role,
-            "token_hash": token_hash,
-            "invited_by": caller_id,
-            "status": "pending"
+        # The database RPC locks the organization and rechecks the actor's
+        # current role before expiring or inserting any invitation.
+        created = supabase.rpc("create_organization_invitation", {
+            "p_organization_id": organization_id,
+            "p_actor_user_id": caller_id,
+            "p_email": email,
+            "p_member_role": role,
+            "p_token_hash": token_hash
         }).execute()
-        inserted_rows = inserted.data or []
-        if not inserted_rows:
+        created_data = created.data
+        if isinstance(created_data, list) and created_data:
+            created_data = created_data[0]
+        if not isinstance(created_data, dict) or not created_data.get("success"):
             raise RuntimeError("Invitation record was not created.")
-        invitation_id = inserted_rows[0].get("id")
+        invitation_id = created_data.get("invitation_id")
 
         redirect_to = os.getenv("SUPABASE_INVITE_REDIRECT_URL", "").strip() or None
         options = {"data": {"ags_invitation_token": token}}
@@ -1823,9 +1806,7 @@ async def create_organization_invitation(
                 supabase.table("organization_invitations").delete().eq("id", invitation_id).execute()
             except Exception:
                 logger.exception("Failed to clean up undelivered organization invitation.")
-        if clean(getattr(exc, "code", "")) == "23505":
-            raise HTTPException(status_code=409, detail="A pending invitation already exists for this email.")
-        raise HTTPException(status_code=503, detail="Invitation could not be sent. No membership was granted.")
+        raise membership_rpc_http_exception(exc)
 
 
 @app.patch("/organizations/{organization_id}/members/{target_user_id}")
