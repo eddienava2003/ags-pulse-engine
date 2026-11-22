@@ -95,3 +95,10 @@ The current implementation includes role changes and member removal through tran
 - The API returns HTTP 410 for an expired token.
 - Invitation creation marks any expired pending invitation for the same organization/email as expired before checking for an existing pending invitation. This releases the partial unique index and permits a fresh invitation.
 - These changes are code-reviewed only; they still require migration and API integration tests in a disposable non-production Supabase environment.
+
+## Invitation authorization concurrency hardening
+
+- Invitation creation now runs through `create_organization_invitation()`, a service-role-only database RPC.
+- The RPC locks the organization row, rechecks the actor's current owner/admin role, enforces owner-only administrator invitations, expires stale invitations, checks for an existing pending invitation, and inserts the new invitation in one transaction.
+- The API retains its early role check for fast feedback, but the database transaction is the authoritative authorization gate. This closes the stale-role time-of-check/time-of-use window.
+- This additional RPC is part of `database/phase1_organization_invitations.sql` and must be applied to the disposable Phase 1 test project before invitation creation can be integration-tested.
