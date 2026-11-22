@@ -32,7 +32,6 @@ create or replace function public.create_organization_invitation(
     p_token_hash text
 ) returns jsonb
 language plpgsql
-security definer
 set search_path = pg_catalog, public
 as $
 declare
