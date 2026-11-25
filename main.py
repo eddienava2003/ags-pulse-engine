@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from datetime import datetime, timezone, date
 import os
+import re
 import json
 import logging
 import secrets
@@ -11,6 +12,7 @@ import math
 import hmac
 import hashlib
 import base64
+from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ags-pulse")
@@ -1796,7 +1798,7 @@ async def create_organization_invitation(
         separator = "&" if "?" in redirect_to else "?"
         callback_url = (
             redirect_to + separator
-            + "invitation_token=" + __import__("urllib.parse", fromlist=["quote"]).quote(token, safe="")
+            + "invitation_id=" + quote(str(invitation_id), safe="")
         )
         supabase.auth.sign_in_with_otp({
             "email": email,
@@ -1920,7 +1922,7 @@ def organization_invitation_callback():
 (async () => {
   const status = document.getElementById("status");
   const params = new URLSearchParams(window.location.search);
-  const invitationToken = params.get("invitation_token") || "";
+  const invitationId = params.get("invitation_id") || "";
   const auth = new URLSearchParams(window.location.hash.slice(1));
   const accessToken = auth.get("access_token") || "";
   const authError = auth.get("error_description") || auth.get("error");
@@ -1933,7 +1935,7 @@ def organization_invitation_callback():
     status.textContent = "Email sign-in could not be completed. Request a new invitation.";
     return;
   }
-  if (!accessToken || invitationToken.length < 32 || invitationToken.length > 256) {
+  if (!accessToken || !/^[0-9a-f-]{36}$/i.test(invitationId)) {
     status.textContent = "This invitation link is incomplete or expired. Request a new invitation.";
     return;
   }
@@ -1945,7 +1947,7 @@ def organization_invitation_callback():
         "Authorization": "Bearer " + accessToken,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ invitation_token: invitationToken })
+      body: JSON.stringify({ invitation_id: invitationId })
     });
     const result = await response.json();
     if (!response.ok || result.success !== true) {
@@ -1991,14 +1993,13 @@ async def accept_organization_invitation(
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="A valid JSON request body is required.")
-    invitation_token = clean(payload.get("invitation_token")) if isinstance(payload, dict) else ""
-    if len(invitation_token) < 32 or len(invitation_token) > 256:
-        raise HTTPException(status_code=422, detail="A valid invitation token is required.")
+    invitation_id = clean(payload.get("invitation_id")) if isinstance(payload, dict) else ""
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", invitation_id):
+        raise HTTPException(status_code=422, detail="A valid invitation reference is required.")
 
-    token_hash = hashlib.sha256(invitation_token.encode("utf-8")).hexdigest()
     try:
-        result = supabase.rpc("accept_organization_invitation", {
-            "p_token_hash": token_hash,
+        result = supabase.rpc("accept_organization_invitation_by_id", {
+            "p_invitation_id": invitation_id,
             "p_user_id": user_id,
             "p_verified_email": email
         }).execute()
