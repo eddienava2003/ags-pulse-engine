@@ -35,7 +35,7 @@ Status: implementation design on an isolated branch; not deployed.
   - `POST /organization-invitations/accept`
   - `PATCH /organizations/{organization_id}/members/{user_id}`
   - `DELETE /organizations/{organization_id}/members/{user_id}`
-- Invitation creation uses Supabase Auth Admin invite delivery via the server-side service credential. Never expose the service credential to clients.
+- Invitation creation uses Supabase passwordless email sign-in (`sign_in_with_otp`) with the existing Auth email delivery configuration. `should_create_user=true` supports new and existing Auth identities; no new credential or email-provider key is introduced.
 - Keep organization authorization checks server-side and derive the actor from the verified bearer token. Never trust an actor/user ID supplied in JSON.
 - Ensure the API distinguishes service-role administrative operations from user-scoped reads and validates every requested organization against the verified actor's membership and role.
 
@@ -64,30 +64,16 @@ Status: implementation design on an isolated branch; not deployed.
 
 The current project has one known Auth user/account and one organization. A second independent Auth identity is still required for the final end-to-end tenant-isolation test. Implementation and static authorization tests can proceed without it, but this does not replace that production verification.
 
-## Invitation email configuration required
+## Invitation email delivery and acceptance
 
-The backend places a one-time invitation token in Supabase Auth invite metadata as `ags_invitation_token`. The project's Auth **Invite user** email template must render this value and direct the user to the application's acceptance screen. For example:
-
-```html
-<p>You have been invited to join an AGS-Pulse organization.</p>
-<p>Invitation token: {{ .Data.ags_invitation_token }}</p>
-<p>After signing in and verifying this email, paste the token into the invitation acceptance screen.</p>
-```
-
-Configure `SUPABASE_INVITE_REDIRECT_URL` in the backend environment to the approved app acceptance URL. Do not deploy until the template and redirect URL are configured and tested. The token is single-use, stored as a SHA-256 digest of a high-entropy random token in the database, and must never be logged.
-
-**SMTP plan gate:** The AGS-Pulse Supabase organization is currently on the Free plan, and the project was created after June 3, 2026. New Free-plan projects using Supabase's default SMTP cannot customize Auth email templates. The actual SMTP provider has not yet been verified. Before treating this invitation flow as usable, confirm whether custom SMTP is configured. If the project uses default SMTP, configure a supported custom SMTP provider before relying on the `{{ .Data.ags_invitation_token }}` template field, or replace this delivery path with a separately tested custom invitation-email workflow. Do not assume the token reaches the invitee merely because it is present in Auth user metadata.
-
-The current implementation includes role changes and member removal through transactional last-owner-safe RPCs, but these operations are untested and must pass the explicit tests above before item 5 can be marked complete. Invitation revocation is not yet implemented.
-
-## Implementation notes and constraints
-
-- Supabase Auth invitation links default to a one-hour expiry in this project configuration; the database invitation expiry is aligned to one hour. The email OTP expiry setting must be checked before deployment. If it differs, align the database default and API response.
-- Supabase Auth returns an error when `invite_user_by_email()` is used for an email that already belongs to a confirmed Auth user. This implementation cleans up the pending invitation record on delivery failure and grants no membership. Supporting already-registered users requires a separate verified email-delivery flow (for example, a custom invitation email provider); it is not silently treated as supported.
-- Only an owner can invite an admin, promote/demote owner/admin roles, or remove an owner/admin. Admins can administer dispatcher/member/viewer roles. The final owner cannot be demoted or removed.
-- The API now enables CORS for PATCH and DELETE because member role updates and removal use those methods.
-- The current endpoint implementation is still unmerged and untested against a disposable Supabase project. Do not apply either SQL file to production.
-
+- Invitation delivery uses Supabase Auth passwordless email sign-in (Magic Link) through the project's existing Auth email provider. The backend calls `sign_in_with_otp` with `should_create_user=true`, so both a new invitee and an already-registered/confirmed Auth user can receive a sign-in link.
+- No custom invitation template variable is required. The existing Supabase Magic Link template must retain its standard confirmation link (normally `{{ .ConfirmationURL }}`). No SMTP/API key, Supabase key, or other secret is changed by this code.
+- Configure the non-secret `SUPABASE_INVITE_REDIRECT_URL` to the exact callback URL `https://<phase1-test-host>/organization-invitations/callback` and ensure that exact URL is included in the Supabase Auth redirect allow list. This is a URL setting, not a key or secret.
+- After the recipient clicks the email link, Supabase returns the authenticated access token in the browser URL fragment. The callback page reads the session token and one-time invitation token, immediately removes both from the visible URL, then calls the authenticated acceptance endpoint. Membership is granted only after the API validates the bearer token, verified email, invitation digest, expiry, and single-use state.
+- The invitation token remains high-entropy, single-use, and stored only as a SHA-256 digest. It is not written to logs or returned by the API. The callback sets no-store and no-referrer response headers.
+- Supabase Auth redirect allow-list and email rate/expiry settings remain external prerequisites. The existing Auth email delivery configuration must successfully deliver a Magic Link; this code does not modify provider settings or credentials.
+- The test deployment must verify delivery to both a new test identity and an existing confirmed identity. The one-hour database invitation expiry must not exceed the configured Magic Link validity.
+- Do not merge or deploy to production until email delivery, callback acceptance, replay rejection, expiry, and two-organization isolation have passed in the isolated Phase 1 environment.
 
 ## Expiry handling correction
 
