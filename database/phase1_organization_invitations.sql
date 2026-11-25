@@ -171,3 +171,77 @@ $$;
 
 revoke all on function public.accept_organization_invitation(text, uuid, text) from public, anon, authenticated;
 grant execute on function public.accept_organization_invitation(text, uuid, text) to service_role;
+
+
+-- Passwordless email-link acceptance uses a non-secret invitation UUID in the
+-- callback URL. Authenticated, verified email matching remains mandatory.
+create or replace function public.accept_organization_invitation_by_id(
+    p_invitation_id uuid,
+    p_user_id uuid,
+    p_verified_email text
+) returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+    invitation public.organization_invitations%rowtype;
+begin
+    if p_invitation_id is null or p_user_id is null
+       or p_verified_email is null or length(trim(p_verified_email)) = 0 then
+        raise exception 'Invalid invitation acceptance request' using errcode = '22023';
+    end if;
+
+    select * into invitation
+    from public.organization_invitations
+    where id = p_invitation_id
+    for update;
+
+    if not found then
+        raise exception 'Invitation is invalid or unavailable' using errcode = 'P0002';
+    end if;
+
+    if invitation.status = 'pending' and invitation.expires_at <= now() then
+        update public.organization_invitations
+        set status = 'expired', updated_at = now()
+        where id = invitation.id;
+        return jsonb_build_object('success', false, 'error', 'invitation_expired');
+    end if;
+
+    if invitation.status <> 'pending' then
+        raise exception 'Invitation is invalid or unavailable' using errcode = 'P0002';
+    end if;
+
+    if lower(invitation.email) <> lower(trim(p_verified_email)) then
+        raise exception 'Invitation email does not match authenticated account' using errcode = '42501';
+    end if;
+
+    if exists (
+        select 1
+        from public.organization_memberships
+        where organization_id = invitation.organization_id
+          and user_id = p_user_id
+    ) then
+        raise exception 'User is already a member of this organization' using errcode = '23505';
+    end if;
+
+    insert into public.organization_memberships (organization_id, user_id, member_role)
+    values (invitation.organization_id, p_user_id, invitation.member_role);
+
+    update public.organization_invitations
+    set status = 'accepted',
+        accepted_by = p_user_id,
+        accepted_at = now(),
+        updated_at = now()
+    where id = invitation.id;
+
+    return jsonb_build_object(
+        'success', true,
+        'organization_id', invitation.organization_id,
+        'member_role', invitation.member_role
+    );
+end;
+$$;
+
+revoke all on function public.accept_organization_invitation_by_id(uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.accept_organization_invitation_by_id(uuid, uuid, text) to service_role;
