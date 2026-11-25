@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from datetime import datetime, timezone, date
@@ -1782,11 +1783,28 @@ async def create_organization_invitation(
             raise RuntimeError("Invitation record was not created.")
         invitation_id = created_data.get("invitation_id")
 
-        redirect_to = os.getenv("SUPABASE_INVITE_REDIRECT_URL", "").strip() or None
-        options = {"data": {"ags_invitation_token": token}}
-        if redirect_to:
-            options["redirect_to"] = redirect_to
-        supabase.auth.admin.invite_user_by_email(email, options=options)
+        # Use Supabase passwordless email sign-in for both new and existing
+        # Auth users. The existing Auth invite endpoint rejects confirmed users.
+        # This reuses the project's current Auth email delivery configuration;
+        # no SMTP/API credentials are changed or copied.
+        redirect_to = os.getenv("SUPABASE_INVITE_REDIRECT_URL", "").strip()
+        if not redirect_to:
+            raise RuntimeError(
+                "SUPABASE_INVITE_REDIRECT_URL must point to "
+                "/organization-invitations/callback."
+            )
+        separator = "&" if "?" in redirect_to else "?"
+        callback_url = (
+            redirect_to + separator
+            + "invitation_token=" + __import__("urllib.parse", fromlist=["quote"]).quote(token, safe="")
+        )
+        supabase.auth.sign_in_with_otp({
+            "email": email,
+            "options": {
+                "should_create_user": True,
+                "email_redirect_to": callback_url
+            }
+        })
 
         return {
             "success": True,
@@ -1880,6 +1898,77 @@ def remove_organization_member(
     except Exception as exc:
         logger.exception("Organization member removal rejected or unavailable.")
         raise membership_rpc_http_exception(exc)
+
+
+@app.get("/organization-invitations/callback", response_class=HTMLResponse)
+def organization_invitation_callback():
+    """Complete a Supabase magic-link sign-in and accept its invitation in-browser."""
+    page = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>AGS-Pulse organization invitation</title>
+</head>
+<body>
+<main>
+<h1>Organization invitation</h1>
+<p id="status" role="status" aria-live="polite">Verifying your sign-in and invitation…</p>
+</main>
+<script>
+(async () => {
+  const status = document.getElementById("status");
+  const params = new URLSearchParams(window.location.search);
+  const invitationToken = params.get("invitation_token") || "";
+  const auth = new URLSearchParams(window.location.hash.slice(1));
+  const accessToken = auth.get("access_token") || "";
+  const authError = auth.get("error_description") || auth.get("error");
+
+  // Remove both the one-time invitation token and session material from
+  // the visible URL/history before making the acceptance request.
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  if (authError) {
+    status.textContent = "Email sign-in could not be completed. Request a new invitation.";
+    return;
+  }
+  if (!accessToken || invitationToken.length < 32 || invitationToken.length > 256) {
+    status.textContent = "This invitation link is incomplete or expired. Request a new invitation.";
+    return;
+  }
+
+  try {
+    const response = await fetch("/organization-invitations/accept", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + accessToken,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ invitation_token: invitationToken })
+    });
+    const result = await response.json();
+    if (!response.ok || result.success !== true) {
+      status.textContent = result.detail || "The invitation could not be accepted. Request a new invitation.";
+      return;
+    }
+    status.textContent = "Your organization invitation has been accepted. You can now sign in to AGS-Pulse.";
+  } catch (_) {
+    status.textContent = "The invitation could not be completed. Please try again.";
+  }
+})();
+</script>
+</body>
+</html>"""
+    return HTMLResponse(
+        content=page,
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY"
+        }
+    )
 
 
 @app.post("/organization-invitations/accept")
